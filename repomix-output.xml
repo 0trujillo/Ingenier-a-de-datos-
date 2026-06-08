@@ -1,0 +1,517 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+consumer/consumer.py
+consumer/Dockerfile
+docker-compose.yml
+lake/__init__.py
+lake/uploader.py
+ml-api/app.py
+ml-api/Dockerfile
+package.json
+producer/Dockerfile
+producer/open-meteo.py
+README.md
+requirements.txt
+test.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="consumer/Dockerfile">
+FROM python:3.11
+
+WORKDIR /app
+
+COPY . .
+
+RUN pip install -r requirements.txt
+
+CMD ["python", "consumer/consumer.py"]
+</file>
+
+<file path="lake/__init__.py">
+
+</file>
+
+<file path="package.json">
+{
+	"dependencies": {
+		"repomix": "^1.14.1"
+	}
+}
+</file>
+
+<file path="producer/Dockerfile">
+FROM python:3.11
+
+WORKDIR /app
+
+COPY . .
+
+RUN pip install -r requirements.txt
+
+CMD ["python", "producer/open-meteo.py"]
+</file>
+
+<file path="producer/open-meteo.py">
+import json
+import time
+import requests
+
+from kafka import KafkaProducer
+
+
+while True:
+    try:
+        producer = KafkaProducer(
+            bootstrap_servers="kafka:9092",
+            value_serializer=lambda v: json.dumps(v).encode("utf-8")
+        )
+
+        print("✅ Kafka listo")
+        break
+
+    except Exception as e:
+        print("Esperando Kafka...", e)
+        time.sleep(5)
+
+LAT = -33.45
+LON = -70.66
+
+while True:
+
+    response = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": LAT,
+            "longitude": LON,
+            "current": "temperature_2m,relative_humidity_2m,wind_speed_10m"
+        }
+    )
+
+    current = response.json()["current"]
+
+    data = {
+        "temperature": current["temperature_2m"],
+        "humidity": current["relative_humidity_2m"],
+        "wind_speed": current["wind_speed_10m"],
+        "timestamp": time.time()
+    }
+
+    producer.send("sensores", data)
+
+    print("Enviado:", data)
+
+    time.sleep(300)
+</file>
+
+<file path="consumer/consumer.py">
+from kafka import KafkaConsumer
+import json
+import logging
+import time
+import sys
+import os
+
+from datadog import initialize, statsd
+
+sys.path.append(
+    os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+)
+
+from lake.uploader import upload
+
+
+# ------------------------
+# Datadog
+# ------------------------
+
+initialize(
+    api_key="4e040f2fee6f2337ce4a56646eccb1fc",
+    statsd_host="datadog",
+    statsd_port=8125
+)
+
+logging.basicConfig(level=logging.INFO)
+
+
+# ------------------------
+# Esperar Kafka
+# ------------------------
+
+while True:
+    try:
+
+        consumer = KafkaConsumer(
+            "sensores",
+            bootstrap_servers="kafka:9092",
+            auto_offset_reset="earliest",
+            value_deserializer=lambda m: json.loads(m.decode("utf-8"))
+        )
+
+        logging.info("✅ Conectado a Kafka")
+        break
+
+    except Exception as e:
+
+        logging.warning(
+            f"⏳ Esperando Kafka: {e}"
+        )
+
+        time.sleep(5)
+
+
+# ------------------------
+# Consumo de eventos
+# ------------------------
+
+for msg in consumer:
+
+    data = msg.value
+
+    temperature = data["temperature"]
+    humidity = data["humidity"]
+    wind = data["wind_speed"]
+
+    logging.info(f"Dato recibido: {data}")
+
+    # ------------------------
+    # Risk Score
+    # ------------------------
+
+    risk = 0
+
+    if temperature > 35:
+        risk += 40
+
+    if humidity < 20:
+        risk += 30
+
+    if wind > 25:
+        risk += 30
+
+    logging.info(f"Risk Score: {risk}")
+
+    # ------------------------
+    # Datadog Metrics
+    # ------------------------
+
+    statsd.gauge(
+        "wildfire.temperature",
+        temperature
+    )
+
+    statsd.gauge(
+        "wildfire.humidity",
+        humidity
+    )
+
+    statsd.gauge(
+        "wildfire.wind_speed",
+        wind
+    )
+
+    statsd.gauge(
+        "wildfire.risk_score",
+        risk
+    )
+
+    # ------------------------
+    # Alerta
+    # ------------------------
+
+    if risk >= 70:
+
+        logging.warning(
+            f"""
+🔥 ALERTA DE INCENDIO
+
+Temperatura: {temperature}
+Humedad: {humidity}
+Viento: {wind}
+Risk Score: {risk}
+"""
+        )
+
+        statsd.increment(
+            "wildfire.alerts"
+        )
+
+    # ------------------------
+    # Data Lake (MinIO)
+    # ------------------------
+
+    record = {
+        "temperature": temperature,
+        "humidity": humidity,
+        "wind_speed": wind,
+        "risk": risk,
+        "timestamp": data["timestamp"]
+    }
+
+    try:
+
+        upload(record)
+
+        logging.info(
+            "✅ Registro enviado a MinIO"
+        )
+
+    except Exception as e:
+
+        logging.error(
+            f"❌ Error subiendo a MinIO: {e}"
+        )
+</file>
+
+<file path="docker-compose.yml">
+version: "3.8"
+
+services:
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: admin123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.0.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.0.1
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  datadog:
+    image: datadog/agent:latest
+    environment:
+      DD_API_KEY: "4e040f2fee6f2337ce4a56646eccb1fc"
+      DD_SITE: "us5.datadoghq.com"
+      DD_LOGS_ENABLED: "true"
+      DD_APM_ENABLED: "true"
+      DD_DOGSTATSD_NON_LOCAL_TRAFFIC: "true"
+      DD_BIND_HOST: "0.0.0.0"
+    ports:
+      - "8125:8125/udp"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    depends_on:
+      - kafka
+
+  consumer:
+    build:
+      context: .
+      dockerfile: consumer/Dockerfile
+    depends_on:
+      - kafka
+      - datadog
+  ml-api:
+    build:
+      context: .
+      dockerfile: ml-api/Dockerfile
+
+    ports:
+      - "8000:8000"
+</file>
+
+<file path="lake/uploader.py">
+import boto3
+import json
+import time
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://minio:9000",
+    aws_access_key_id="admin",
+    aws_secret_access_key="admin123"
+)
+
+try:
+    s3.head_bucket(Bucket="bronze")
+except:
+    s3.create_bucket(Bucket="bronze")
+
+def upload(data):
+    s3.put_object(
+        Bucket="bronze",
+        Key=f"data_{int(time.time())}.json",
+        Body=json.dumps(data)
+    )
+</file>
+
+<file path="ml-api/app.py">
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def home():
+    return {"status": "ok"}
+
+@app.post("/predict")
+def predict(data: dict):
+    temp = data["temp"]
+
+    if temp > 75:
+        return {"risk": "alto"}
+    return {"risk": "normal"}
+</file>
+
+<file path="ml-api/Dockerfile">
+FROM python:3.10
+
+WORKDIR /app
+
+COPY . .
+
+RUN pip install fastapi uvicorn
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+</file>
+
+<file path="requirements.txt">
+kafka-python
+boto3
+fastapi
+uvicorn
+scikit-learn
+datadog
+</file>
+
+<file path="test.py">
+from datadog import initialize, statsd
+import time
+
+initialize(
+    api_key="4e040f2fee6f2337ce4a56646eccb1fc"
+)
+
+print("Enviando métricas de prueba...")
+
+for i in range(10):
+
+    statsd.gauge("wildfire.temperature", 40)
+    statsd.gauge("wildfire.humidity", 10)
+    statsd.gauge("wildfire.wind_speed", 30)
+    statsd.gauge("wildfire.risk_score", 100)
+
+    statsd.increment("wildfire.alerts")
+
+    print(f"Prueba #{i+1}")
+
+    time.sleep(2)
+
+print("Finalizado")
+</file>
+
+<file path="README.md">
+# Ingenieria-de-datos-
+| AWS                   | Local (Docker)           |
+| --------------------- | ------------------------ |
+| S3 (Bronze/Plata/Oro) | MinIO                    |
+| Kinesis               | Kafka                    |
+| IoT Core              | Producer Python          |
+| Flink                 | Spark Streaming o Python |
+| SageMaker             | Scikit-learn + FastAPI   |
+| Athena                | Trino / DuckDB           |
+| QuickSight            | Metabase / Superset      |
+| EventBridge           | Kafka / Python events    |
+| SNS                   | Datadog Alerts           |
+| CloudWatch            | Datadog                  |
+
+instalar dependencias: pip install -r requirements.txt
+Levantar docker: docker-compose up -d
+docker logs ingenier-a-de-datos--datadog-1
+visualizacion: sensor.temperatura
+
+| Valor | Significado    |
+| ----- | -------------- |
+| 25    | normal ✅       |
+| 50    | carga media ⚠️ |
+| 80    | caliente 🔥    |
+| 95    | crítico 🚨     |
+
+Open-Meteo API
+      ↓
+AWS Lambda
+      ↓
+Amazon S3
+      ↓
+AWS Glue Catalog
+      ↓
+Amazon Athena
+      ↓
+Data Warehouse
+      ↓
+Dashboard React
+</file>
+
+</files>

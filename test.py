@@ -1,11 +1,23 @@
-from datadog import initialize
-from datadog.dogstatsd import DogStatsd
+from datadog import initialize, statsd
 import time
 
-# 👇 IMPORTANTE: usar host explícito
-statsd = DogStatsd(host="127.0.0.1", port=8125)
+initialize(
+    api_key="4e040f2fee6f2337ce4a56646eccb1fc"
+)
 
-for i in range(20):
-    statsd.gauge('test.metric', i)
-    print("enviado", i)
-    time.sleep(1)
+print("Enviando métricas de prueba...")
+
+for i in range(10):
+
+    statsd.gauge("wildfire.temperature", 40)
+    statsd.gauge("wildfire.humidity", 10)
+    statsd.gauge("wildfire.wind_speed", 30)
+    statsd.gauge("wildfire.risk_score", 100)
+
+    statsd.increment("wildfire.alerts")
+
+    print(f"Prueba #{i+1}")
+
+    time.sleep(2)
+
+print("Finalizado")
