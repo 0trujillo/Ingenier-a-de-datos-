@@ -24,8 +24,16 @@ services:
     ports:
       - "9092:9092"
     environment:
+      KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
 
   datadog:
     image: datadog/agent:latest
@@ -35,8 +43,30 @@ services:
       DD_LOGS_ENABLED: "true"
       DD_APM_ENABLED: "true"
       DD_DOGSTATSD_NON_LOCAL_TRAFFIC: "true"
-      DD_BIND_HOST: "0.0.0.0"  
+      DD_BIND_HOST: "0.0.0.0"
     ports:
       - "8125:8125/udp"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    depends_on:
+      - kafka
+
+  consumer:
+    build:
+      context: .
+      dockerfile: consumer/Dockerfile
+    depends_on:
+      - kafka
+      - datadog
+  ml-api:
+    build:
+      context: .
+      dockerfile: ml-api/Dockerfile
+
+    ports:
+      - "8000:8000"

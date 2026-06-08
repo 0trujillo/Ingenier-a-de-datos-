@@ -23,3 +23,17 @@ visualizacion: sensor.temperatura
 | 50    | carga media ⚠️ |
 | 80    | caliente 🔥    |
 | 95    | crítico 🚨     |
+
+Open-Meteo API
+      ↓
+AWS Lambda
+      ↓
+Amazon S3
+      ↓
+AWS Glue Catalog
+      ↓
+Amazon Athena
+      ↓
+Data Warehouse
+      ↓
+Dashboard React
