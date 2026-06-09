@@ -15,18 +15,19 @@ sys.path.append(
 
 from lake.bronze.bronze import upload
 
-
-# ------------------------
-# Datadog
-# ------------------------
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+DATADOG_HOST = os.getenv("DATADOG_HOST", "datadog")
+DATADOG_PORT = int(os.getenv("DATADOG_PORT", "8125"))
 
 initialize(
-    api_key="4e040f2fee6f2337ce4a56646eccb1fc",
-    statsd_host="datadog",
-    statsd_port=8125
+    statsd_host=DATADOG_HOST,
+    statsd_port=DATADOG_PORT
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 
 
 # ------------------------
@@ -38,7 +39,7 @@ while True:
 
         consumer = KafkaConsumer(
             "sensores",
-            bootstrap_servers="kafka:9092",
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
             auto_offset_reset="earliest",
             value_deserializer=lambda m: json.loads(m.decode("utf-8"))
         )
@@ -47,10 +48,7 @@ while True:
         break
 
     except Exception as e:
-
-        logging.warning(
-            f"⏳ Esperando Kafka: {e}"
-        )
+        logging.warning("⏳ Esperando Kafka: %s", e)
 
         time.sleep(5)
 
@@ -64,15 +62,9 @@ for msg in consumer:
     data = msg.value
 
     try:
-
         upload(data)
-
-        logging.info(
-            "✅ Registro enviado a Bronze"
-        )
-
-    except Exception as e:
-
-        logging.error(
-            f"❌ Error subiendo a Bronze: {e}"
-        )
+        statsd.increment("bronze.registros.recibidos")
+        logging.info("✅ Registro enviado a Bronze")
+    except Exception as exc:
+        statsd.increment("bronze.registros.fallidos")
+        logging.error("❌ Error subiendo a Bronze: %s", exc, exc_info=True)

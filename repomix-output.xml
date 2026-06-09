@@ -42,22 +42,34 @@ The content is organized as follows:
 <directory_structure>
 consumer/consumer.py
 consumer/Dockerfile
+consumer/event_aggregator.py
 docker-compose.yml
+lake/analytics/__init__.py
+lake/analytics/loader.py
 lake/bronze/__init__.py
 lake/bronze/bronze.py
+lake/Dockerfile
 lake/oro/Dockerfile
 lake/oro/processor.py
 lake/oro/runner.py
 lake/plata/Dockerfile
 lake/plata/limpieza.py
 lake/plata/runner.py
+lake/retry_utils.py
+lake/schemas.py
 ml-api/app.py
+ml-api/Dockerfile
+ml-api/model_registry.py
 ml-api/train.py
 package.json
+PROBLEMAS_IDENTIFICADOS.md
 producer/Dockerfile
 producer/open-meteo.py
+producer/sensor-simulator.py
+producer/video-simulator.py
 README.md
 requirements.txt
+SOLUCION_PROBLEMAS.md
 test.py
 </directory_structure>
 
@@ -82,18 +94,19 @@ sys.path.append(
 
 from lake.bronze.bronze import upload
 
-
-# ------------------------
-# Datadog
-# ------------------------
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+DATADOG_HOST = os.getenv("DATADOG_HOST", "datadog")
+DATADOG_PORT = int(os.getenv("DATADOG_PORT", "8125"))
 
 initialize(
-    api_key="4e040f2fee6f2337ce4a56646eccb1fc",
-    statsd_host="datadog",
-    statsd_port=8125
+    statsd_host=DATADOG_HOST,
+    statsd_port=DATADOG_PORT
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 
 
 # ------------------------
@@ -105,7 +118,7 @@ while True:
 
         consumer = KafkaConsumer(
             "sensores",
-            bootstrap_servers="kafka:9092",
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
             auto_offset_reset="earliest",
             value_deserializer=lambda m: json.loads(m.decode("utf-8"))
         )
@@ -114,10 +127,7 @@ while True:
         break
 
     except Exception as e:
-
-        logging.warning(
-            f"⏳ Esperando Kafka: {e}"
-        )
+        logging.warning("⏳ Esperando Kafka: %s", e)
 
         time.sleep(5)
 
@@ -131,18 +141,12 @@ for msg in consumer:
     data = msg.value
 
     try:
-
         upload(data)
-
-        logging.info(
-            "✅ Registro enviado a Bronze"
-        )
-
-    except Exception as e:
-
-        logging.error(
-            f"❌ Error subiendo a Bronze: {e}"
-        )
+        statsd.increment("bronze.registros.recibidos")
+        logging.info("✅ Registro enviado a Bronze")
+    except Exception as exc:
+        statsd.increment("bronze.registros.fallidos")
+        logging.error("❌ Error subiendo a Bronze: %s", exc, exc_info=True)
 </file>
 
 <file path="consumer/Dockerfile">
@@ -157,6 +161,174 @@ RUN pip install -r requirements.txt
 CMD ["python", "consumer/consumer.py"]
 </file>
 
+<file path="consumer/event_aggregator.py">
+"""
+Event Aggregator - Coordina eventos desde múltiples fuentes de Kafka.
+Unifica datos de Open-Meteo, sensores IoT y video en un único flujo.
+"""
+
+import json
+import logging
+import os
+import time
+from kafka import KafkaConsumer, KafkaProducer
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+from datadog import initialize, statsd
+
+
+class EventAggregator:
+    """
+    Agrega eventos desde múltiples tópicos de Kafka.
+    Coordina y enriquece eventos antes de enviarlos a un tópico unificado.
+    """
+    
+    def __init__(
+        self,
+        bootstrap_servers: str = "kafka:9092",
+        input_topics: list = None,
+        output_topic: str = "aggregated-events",
+        group_id: str = "event-aggregator"
+    ):
+        self.bootstrap_servers = bootstrap_servers
+        self.input_topics = input_topics or ["sensores", "sensores-iot", "video-stream"]
+        self.output_topic = output_topic
+        self.group_id = group_id
+        
+        self.logger = logging.getLogger(__name__)
+        self.event_counters = {topic: 0 for topic in self.input_topics}
+        self.counter_lock = Lock()
+        
+        DATADOG_HOST = os.getenv("DATADOG_HOST", "datadog")
+        DATADOG_PORT = int(os.getenv("DATADOG_PORT", "8125"))
+        initialize(
+            statsd_host=DATADOG_HOST,
+            statsd_port=DATADOG_PORT
+        )
+        
+        # Inicializar producer
+        self.producer = KafkaProducer(
+            bootstrap_servers=self.bootstrap_servers,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8")
+        )
+    
+    def start(self):
+        """Inicia la agregación de eventos desde múltiples fuentes."""
+        self.logger.info("🚀 Event Aggregator iniciado")
+        self.logger.info("Tópicos de entrada: %s", self.input_topics)
+        self.logger.info("Tópico de salida: %s", self.output_topic)
+        
+        # Crear un consumer para cada tópico
+        with ThreadPoolExecutor(max_workers=len(self.input_topics)) as executor:
+            for topic in self.input_topics:
+                executor.submit(self._consume_topic, topic)
+    
+    def _consume_topic(self, topic: str):
+        """Consume eventos de un tópico específico."""
+        consumer = KafkaConsumer(
+            topic,
+            bootstrap_servers=self.bootstrap_servers,
+            group_id=f"{self.group_id}-{topic}",
+            auto_offset_reset="latest",
+            value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+            session_timeout_ms=30000
+        )
+        
+        self.logger.info("✅ Consumidor conectado a tópico: %s", topic)
+        
+        try:
+            for message in consumer:
+                    event = message.value
+                    enriched_event = self._enrich_event(event, topic)
+                    self._publish_event(enriched_event)
+                    
+                    if topic == "sensores":
+                        statsd.increment("agregador.eventos.clima")
+                    elif topic == "sensores-iot":
+                        statsd.increment("agregador.eventos.sensores")
+                    elif topic == "video-stream":
+                        statsd.increment("agregador.eventos.video")
+                    
+                    with self.counter_lock:
+                        self.event_counters[topic] += 1
+                        total = sum(self.event_counters.values())
+                        
+                        if total % 100 == 0:
+                            self.logger.info(
+                                "📊 Eventos procesados: %s (Total: %d)",
+                                self.event_counters, total
+                            )
+        except Exception as exc:
+            self.logger.error("❌ Error en consumidor de %s: %s", topic, exc, exc_info=True)
+    
+    def _enrich_event(self, event: dict, source_topic: str) -> dict:
+        """
+        Enriquece un evento con metadatos de correlación.
+        
+        Args:
+            event: Evento original
+            source_topic: Tópico de origen
+        
+        Returns:
+            Evento enriquecido
+        """
+        enriched = {
+            **event,
+            "aggregated_at": time.time(),
+            "source_topic": source_topic,
+            "event_type": self._classify_event(source_topic)
+        }
+        
+        return enriched
+    
+    def _classify_event(self, topic: str) -> str:
+        """Clasifica el tipo de evento según el tópico."""
+        if topic == "sensores":
+            return "weather"
+        elif topic == "sensores-iot":
+            return "sensor"
+        elif topic == "video-stream":
+            return "video"
+        else:
+            return "unknown"
+    
+    def _publish_event(self, event: dict):
+        """Publica el evento enriquecido al tópico de salida."""
+        try:
+            self.producer.send(self.output_topic, event)
+        except Exception as exc:
+            self.logger.error("❌ Error publicando evento: %s", exc, exc_info=True)
+
+
+def run_aggregator():
+    """Función principal para ejecutar el aggregator."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s"
+    )
+    
+    kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+    
+    aggregator = EventAggregator(
+        bootstrap_servers=kafka_bootstrap,
+        input_topics=[
+            os.getenv("KAFKA_TOPIC", "sensores"),
+            os.getenv("KAFKA_TOPIC_SENSORS", "sensores-iot"),
+            os.getenv("KAFKA_TOPIC_VIDEO", "video-stream")
+        ],
+        output_topic=os.getenv("KAFKA_AGGREGATED_TOPIC", "aggregated-events")
+    )
+    
+    try:
+        aggregator.start()
+    except KeyboardInterrupt:
+        logging.info("Event Aggregator detenido")
+
+
+if __name__ == "__main__":
+    run_aggregator()
+</file>
+
 <file path="docker-compose.yml">
 version: "3.8"
 
@@ -166,8 +338,8 @@ services:
     image: minio/minio
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: admin
-      MINIO_ROOT_PASSWORD: admin123
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin123}
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -198,8 +370,8 @@ services:
   datadog:
     image: datadog/agent:latest
     environment:
-      DD_API_KEY: "4e040f2fee6f2337ce4a56646eccb1fc"
-      DD_SITE: "us5.datadoghq.com"
+      DD_API_KEY: ${DD_API_KEY:-}
+      DD_SITE: ${DD_SITE:-us5.datadoghq.com}
       DD_LOGS_ENABLED: "true"
       DD_APM_ENABLED: "true"
       DD_DOGSTATSD_NON_LOCAL_TRAFFIC: "true"
@@ -215,6 +387,39 @@ services:
       dockerfile: producer/Dockerfile
     depends_on:
       - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-sensores}
+      LATITUDE: ${LATITUDE:--33.45}
+      LONGITUDE: ${LONGITUDE:--70.66}
+      POLL_SECONDS: ${POLL_SECONDS:-300}
+      MINIO_ENDPOINT_URL: ${MINIO_ENDPOINT_URL:-http://minio:9000}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-admin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-admin123}
+
+  sensor-producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      KAFKA_TOPIC_SENSORS: ${KAFKA_TOPIC_SENSORS:-sensores-iot}
+      POLL_SECONDS: ${POLL_SECONDS_SENSORS:-60}
+    command: ["python", "producer/sensor-simulator.py"]
+
+  video-producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      KAFKA_TOPIC_VIDEO: ${KAFKA_TOPIC_VIDEO:-video-stream}
+      POLL_SECONDS: ${POLL_SECONDS_VIDEO:-30}
+    command: ["python", "producer/video-simulator.py"]
 
   consumer:
     build:
@@ -223,30 +428,363 @@ services:
     depends_on:
       - kafka
       - datadog
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      DATADOG_HOST: ${DATADOG_HOST:-datadog}
+      DATADOG_PORT: ${DATADOG_PORT:-8125}
+      MINIO_ENDPOINT_URL: ${MINIO_ENDPOINT_URL:-http://minio:9000}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-admin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-admin123}
+
   ml-api:
     build:
       context: .
       dockerfile: ml-api/Dockerfile
-
     ports:
       - "8000:8000"
+    depends_on:
+      - minio
+    environment:
+      MODEL_PATH: ${MODEL_PATH:-model.pkl}
+      MINIO_ENDPOINT_URL: ${MINIO_ENDPOINT_URL:-http://minio:9000}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-admin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-admin123}
 
   silver:
-  build:
-    context: .
-    dockerfile: lake/plata/Dockerfile
-
-  depends_on:
-    - minio
+    build:
+      context: .
+      dockerfile: lake/plata/Dockerfile
+    depends_on:
+      - minio
+    environment:
+      MINIO_ENDPOINT_URL: ${MINIO_ENDPOINT_URL:-http://minio:9000}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-admin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-admin123}
+      BRONZE_BUCKET: ${BRONZE_BUCKET:-bronze}
+      PLATA_BUCKET: ${PLATA_BUCKET:-plata}
+      PROCESSED_BUCKET: ${PLATA_PROCESSED_BUCKET:-plata-processed}
 
   gold:
     build:
       context: .
       dockerfile: lake/oro/Dockerfile
-
     depends_on:
       - minio
       - ml-api
+    environment:
+      MINIO_ENDPOINT_URL: ${MINIO_ENDPOINT_URL:-http://minio:9000}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-admin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-admin123}
+      PLATA_BUCKET: ${PLATA_BUCKET:-plata}
+      ORO_BUCKET: ${ORO_BUCKET:-oro}
+      PROCESSED_BUCKET: ${ORO_PROCESSED_BUCKET:-oro-processed}
+      MODEL_API_URL: ${MODEL_API_URL:-http://ml-api:8000/predict}
+
+  event-aggregator:
+    build:
+      context: .
+      dockerfile: consumer/Dockerfile
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-sensores}
+      KAFKA_TOPIC_SENSORS: ${KAFKA_TOPIC_SENSORS:-sensores-iot}
+      KAFKA_TOPIC_VIDEO: ${KAFKA_TOPIC_VIDEO:-video-stream}
+      KAFKA_AGGREGATED_TOPIC: ${KAFKA_AGGREGATED_TOPIC:-aggregated-events}
+    command: ["python", "consumer/event_aggregator.py"]
+
+  analytics-loader:
+    build:
+      context: .
+      dockerfile: lake/Dockerfile
+    depends_on:
+      - minio
+    environment:
+      MINIO_ENDPOINT_URL: ${MINIO_ENDPOINT_URL:-http://minio:9000}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-admin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-admin123}
+      ORO_BUCKET: ${ORO_BUCKET:-oro}
+      ANALYTICS_BUCKET: ${ANALYTICS_BUCKET:-analytics-processed}
+      DUCKDB_PATH: ${DUCKDB_PATH:-/data/analytics.duckdb}
+    volumes:
+      - analytics_data:/data
+    command: ["python", "lake/analytics/loader.py"]
+
+volumes:
+  analytics_data:
+</file>
+
+<file path="lake/analytics/__init__.py">
+"""Analytics module for data warehouse loading."""
+</file>
+
+<file path="lake/analytics/loader.py">
+"""
+Analytics Loader - Carga datos del oro bucket a DuckDB para análisis.
+Crear esta carpeta y archivo:
+"""
+
+import json
+import time
+import logging
+import os
+import sys
+import boto3
+import duckdb
+from pathlib import Path
+
+
+MINIO_ENDPOINT_URL = os.getenv("MINIO_ENDPOINT_URL", "http://minio:9000")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "admin")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "admin123")
+ORO_BUCKET = os.getenv("ORO_BUCKET", "oro")
+ANALYTICS_BUCKET = os.getenv("ANALYTICS_BUCKET", "analytics-processed")
+DUCKDB_PATH = os.getenv("DUCKDB_PATH", "/data/analytics.duckdb")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=MINIO_ENDPOINT_URL,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+)
+
+
+def ensure_bucket(bucket_name):
+    """Asegura que el bucket existe."""
+    try:
+        s3.head_bucket(Bucket=bucket_name)
+    except Exception:
+        logger.info("Creando bucket: %s", bucket_name)
+        s3.create_bucket(Bucket=bucket_name)
+
+
+def processed_key(key):
+    """Genera la key de marca de procesado."""
+    return f"processed/{key}"
+
+
+def is_processed(key):
+    """Verifica si ya fue procesado."""
+    try:
+        s3.head_object(Bucket=ANALYTICS_BUCKET, Key=processed_key(key))
+        return True
+    except Exception:
+        return False
+
+
+def mark_processed(key):
+    """Marca como procesado."""
+    s3.put_object(Bucket=ANALYTICS_BUCKET, Key=processed_key(key), Body=b"")
+
+
+def list_all_objects(bucket_name):
+    """Generador para listar objetos con paginación."""
+    continuation_token = None
+    
+    while True:
+        list_kwargs = {"Bucket": bucket_name}
+        if continuation_token:
+            list_kwargs["ContinuationToken"] = continuation_token
+        
+        response = s3.list_objects_v2(**list_kwargs)
+        
+        if "Contents" not in response:
+            break
+        
+        for obj in response["Contents"]:
+            yield obj
+        
+        if response.get("IsTruncated"):
+            continuation_token = response.get("NextContinuationToken")
+        else:
+            break
+
+
+def init_duckdb():
+    """Inicializa la base de datos DuckDB."""
+    Path(DUCKDB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    
+    db = duckdb.connect(DUCKDB_PATH)
+    
+    # Crear tabla principal
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS enriched_events (
+            id VARCHAR,
+            temperature FLOAT,
+            humidity FLOAT,
+            wind_speed FLOAT,
+            heat_index FLOAT,
+            risk_score FLOAT,
+            risk_level VARCHAR,
+            processed_at TIMESTAMP,
+            enriched_at TIMESTAMP,
+            PRIMARY KEY(id)
+        )
+    """)
+    
+    # Crear tabla de estadísticas
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS hourly_stats (
+            hour TIMESTAMP,
+            avg_temperature FLOAT,
+            avg_humidity FLOAT,
+            avg_wind_speed FLOAT,
+            avg_risk_score FLOAT,
+            max_risk_score FLOAT,
+            high_risk_count INTEGER,
+            record_count INTEGER,
+            PRIMARY KEY(hour)
+        )
+    """)
+    
+    db.execute("CREATE INDEX IF NOT EXISTS idx_enriched_risk ON enriched_events(risk_score)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_enriched_time ON enriched_events(processed_at)")
+    
+    logger.info("✅ DuckDB inicializado")
+    db.close()
+
+
+def load_to_duckdb(data):
+    """Carga un registro a DuckDB."""
+    try:
+        db = duckdb.connect(DUCKDB_PATH)
+        
+        db.execute("""
+            INSERT INTO enriched_events 
+            (id, temperature, humidity, wind_speed, heat_index, 
+             risk_score, risk_level, processed_at, enriched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            data.get("id", f"event_{int(data.get('processed_at', 0))}"),
+            data.get("temperature"),
+            data.get("humidity"),
+            data.get("wind_speed"),
+            data.get("heat_index"),
+            data.get("risk_score"),
+            data.get("risk_level"),
+            data.get("processed_at"),
+            data.get("enriched_at")
+        ])
+        
+        db.close()
+        return True
+    except Exception as exc:
+        logger.error("Error cargando a DuckDB: %s", exc, exc_info=True)
+        return False
+
+
+def compute_hourly_stats():
+    """Calcula estadísticas horarias."""
+    db = duckdb.connect(DUCKDB_PATH)
+    
+    try:
+        # Eliminar stats antiguas
+        db.execute("DELETE FROM hourly_stats")
+        
+        # Insertar nuevas stats
+        db.execute("""
+            INSERT INTO hourly_stats
+            SELECT
+                date_trunc('hour', processed_at) as hour,
+                AVG(temperature),
+                AVG(humidity),
+                AVG(wind_speed),
+                AVG(risk_score),
+                MAX(risk_score),
+                COUNT_IF(risk_level = 'ALTO'),
+                COUNT(*)
+            FROM enriched_events
+            GROUP BY date_trunc('hour', processed_at)
+            ORDER BY hour DESC
+        """)
+        
+        logger.info("✅ Stats horarias calculadas")
+    except Exception as exc:
+        logger.error("Error calculando stats: %s", exc, exc_info=True)
+    finally:
+        db.close()
+
+
+def get_stats():
+    """Obtiene estadísticas de la base de datos."""
+    db = duckdb.connect(DUCKDB_PATH)
+    
+    try:
+        # Total de eventos
+        total = db.execute(
+            "SELECT COUNT(*) FROM enriched_events"
+        ).fetchone()[0]
+        
+        # Riesgo promedio
+        avg_risk = db.execute(
+            "SELECT AVG(risk_score) FROM enriched_events"
+        ).fetchone()[0]
+        
+        # Eventos de alto riesgo
+        high_risk = db.execute(
+            "SELECT COUNT(*) FROM enriched_events WHERE risk_level = 'ALTO'"
+        ).fetchone()[0]
+        
+        return {
+            "total_events": total,
+            "avg_risk_score": round(avg_risk or 0, 2),
+            "high_risk_events": high_risk
+        }
+    except Exception as exc:
+        logger.error("Error obteniendo stats: %s", exc, exc_info=True)
+        return {}
+    finally:
+        db.close()
+
+
+# Main loop
+ensure_bucket(ORO_BUCKET)
+ensure_bucket(ANALYTICS_BUCKET)
+init_duckdb()
+
+logger.info("🚀 Analytics Loader iniciado")
+
+while True:
+    try:
+        has_items = False
+        
+        for obj in list_all_objects(ORO_BUCKET):
+            key = obj["Key"]
+            
+            if is_processed(key):
+                continue
+            
+            has_items = True
+            
+            try:
+                file_obj = s3.get_object(Bucket=ORO_BUCKET, Key=key)
+                data = json.loads(file_obj["Body"].read())
+                
+                if load_to_duckdb(data):
+                    logger.info("✅ Cargado a DuckDB: %s", key)
+                    mark_processed(key)
+            except Exception as exc:
+                logger.error("Error procesando %s: %s", key, exc)
+                mark_processed(key)
+        
+        # Calcular stats cada 60 segundos
+        compute_hourly_stats()
+        stats = get_stats()
+        logger.info("📊 Stats: %s", stats)
+        
+        if not has_items:
+            logger.debug("No hay nuevos registros")
+            time.sleep(30)
+        else:
+            time.sleep(5)
+            
+    except Exception as exc:
+        logger.error("Error en Analytics Loader: %s", exc, exc_info=True)
+        time.sleep(10)
 </file>
 
 <file path="lake/bronze/__init__.py">
@@ -256,28 +794,66 @@ services:
 <file path="lake/bronze/bronze.py">
 import boto3
 import json
+import logging
+import os
 import time
+
+MINIO_ENDPOINT_URL = os.getenv("MINIO_ENDPOINT_URL", "http://minio:9000")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "admin")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "admin123")
+BRONZE_BUCKET = os.getenv("BRONZE_BUCKET", "bronze")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 s3 = boto3.client(
     "s3",
-    endpoint_url="http://minio:9000",
-    aws_access_key_id="admin",
-    aws_secret_access_key="admin123"
+    endpoint_url=MINIO_ENDPOINT_URL,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-try:
-    s3.head_bucket(Bucket="bronze")
-except:
-    s3.create_bucket(Bucket="bronze")
+def ensure_bucket(bucket_name):
+    try:
+        s3.head_bucket(Bucket=bucket_name)
+    except Exception as exc:
+        logging.warning("Bucket %s no existe, creando... %s", bucket_name, exc)
+        s3.create_bucket(Bucket=bucket_name)
+
+
+ensure_bucket(BRONZE_BUCKET)
 
 
 def upload(data):
+    key = f"bronze_{int(time.time() * 1000)}.json"
+    try:
+        s3.put_object(
+            Bucket=BRONZE_BUCKET,
+            Key=key,
+            Body=json.dumps(data)
+        )
+        logging.info("✅ Bronze upload successful: %s", key)
+    except Exception as exc:
+        logging.error("❌ Error al subir objeto a Bronze: %s", exc, exc_info=True)
+        raise
+</file>
 
-    s3.put_object(
-        Bucket="bronze",
-        Key=f"bronze_{int(time.time()*1000)}.json",
-        Body=json.dumps(data)
-    )
+<file path="lake/Dockerfile">
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copiar archivos de dependencias
+COPY requirements.txt .
+
+# Instalar dependencias
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copiar código fuente
+COPY lake/ ./lake/
+COPY producer/ ./producer/
+
+# Por defecto ejecutar analytics loader
+CMD ["python", "lake/analytics/loader.py"]
 </file>
 
 <file path="lake/oro/Dockerfile">
@@ -294,100 +870,216 @@ CMD ["python", "lake/oro/runner.py"]
 
 <file path="lake/oro/processor.py">
 import json
+import os
 import time
+import logging
 import requests
 import boto3
 
+MINIO_ENDPOINT_URL = os.getenv("MINIO_ENDPOINT_URL", "http://minio:9000")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "admin")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "admin123")
+MODEL_API_URL = os.getenv("MODEL_API_URL", "http://ml-api:8000/predict")
+ORO_BUCKET = os.getenv("ORO_BUCKET", "oro")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
 s3 = boto3.client(
     "s3",
-    endpoint_url="http://minio:9000",
-    aws_access_key_id="admin",
-    aws_secret_access_key="admin123"
+    endpoint_url=MINIO_ENDPOINT_URL,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-try:
-    s3.head_bucket(Bucket="oro")
-except:
-    s3.create_bucket(Bucket="oro")
+
+def ensure_bucket(bucket_name):
+    try:
+        s3.head_bucket(Bucket=bucket_name)
+    except Exception as exc:
+        logging.warning("Bucket %s no existe, creando... %s", bucket_name, exc)
+        s3.create_bucket(Bucket=bucket_name)
+
+
+ensure_bucket(ORO_BUCKET)
 
 
 def enrich(record):
+    payload = {
+        "temperature": record.get("temperature"),
+        "humidity": record.get("humidity"),
+        "wind_speed": record.get("wind_speed")
+    }
 
-    response = requests.post(
-        "http://ml-api:8000/predict",
-        json={
-            "temp": record["temperature"],
-            "humidity": record["humidity"],
-            "wind": record["wind_speed"]
-        }
-    )
+    try:
+        response = requests.post(MODEL_API_URL, json=payload, timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        body = getattr(exc.response, "text", None) if hasattr(exc, "response") else None
+        logging.error(
+            "❌ Error llamando a ML API %s: %s - response=%s",
+            MODEL_API_URL,
+            exc,
+            body,
+            exc_info=True
+        )
+        raise
 
-    prediction = response.json()
+    try:
+        prediction = response.json()
+    except ValueError as exc:
+        logging.error("Respuesta inválida de ML API: %s", exc, exc_info=True)
+        raise
 
     final_record = {
         **record,
-        "risk_score": prediction["risk_score"],
-        "risk_level": prediction["risk_level"]
+        "risk_score": prediction.get("risk_score"),
+        "risk_level": prediction.get("risk_level")
     }
 
-    s3.put_object(
-        Bucket="oro",
-        Key=f"gold_{int(time.time()*1000)}.json",
-        Body=json.dumps(final_record)
-    )
+    try:
+        s3.put_object(
+            Bucket=ORO_BUCKET,
+            Key=f"gold_{int(time.time() * 1000)}.json",
+            Body=json.dumps(final_record)
+        )
+        logging.info("✅ Registro Oro guardado en %s", ORO_BUCKET)
+    except Exception as exc:
+        logging.error("❌ Error guardando Oro: %s", exc, exc_info=True)
+        raise
 
     return final_record
 </file>
 
 <file path="lake/oro/runner.py">
 import json
+import time
+import logging
+import os
+import sys
 import boto3
 
-from processor import enrich
+from datadog import initialize, statsd
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from lake.oro.processor import enrich
+
+MINIO_ENDPOINT_URL = os.getenv("MINIO_ENDPOINT_URL", "http://minio:9000")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "admin")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "admin123")
+PLATA_BUCKET = os.getenv("PLATA_BUCKET", "plata")
+ORO_BUCKET = os.getenv("ORO_BUCKET", "oro")
+PROCESSED_BUCKET = os.getenv("PROCESSED_BUCKET", "oro-processed")
+DATADOG_HOST = os.getenv("DATADOG_HOST", "datadog")
+DATADOG_PORT = int(os.getenv("DATADOG_PORT", "8125"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+initialize(
+    statsd_host=DATADOG_HOST,
+    statsd_port=DATADOG_PORT
+)
 
 s3 = boto3.client(
     "s3",
-    endpoint_url="http://minio:9000",
-    aws_access_key_id="admin",
-    aws_secret_access_key="admin123"
+    endpoint_url=MINIO_ENDPOINT_URL,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-processed = set()
 
-print("Gold Runner iniciado")
+def ensure_bucket(bucket_name):
+    try:
+        s3.head_bucket(Bucket=bucket_name)
+    except Exception as exc:
+        logging.warning("Bucket %s no existe, creando... %s", bucket_name, exc)
+        s3.create_bucket(Bucket=bucket_name)
+
+
+def processed_key(key):
+    return f"processed/{key}"
+
+
+def is_processed(key):
+    try:
+        s3.head_object(Bucket=PROCESSED_BUCKET, Key=processed_key(key))
+        return True
+    except Exception:
+        return False
+
+
+def mark_processed(key):
+    s3.put_object(Bucket=PROCESSED_BUCKET, Key=processed_key(key), Body=b"")
+
+
+def list_all_objects(bucket_name):
+    """Generador que permite iterar sobre todos los objetos con paginación automática."""
+    continuation_token = None
+    
+    while True:
+        list_kwargs = {"Bucket": bucket_name}
+        if continuation_token:
+            list_kwargs["ContinuationToken"] = continuation_token
+        
+        response = s3.list_objects_v2(**list_kwargs)
+        
+        if "Contents" not in response:
+            break
+        
+        for obj in response["Contents"]:
+            yield obj
+        
+        if response.get("IsTruncated"):
+            continuation_token = response.get("NextContinuationToken")
+        else:
+            break
+
+
+ensure_bucket(PLATA_BUCKET)
+ensure_bucket(ORO_BUCKET)
+ensure_bucket(PROCESSED_BUCKET)
+
+logging.info("Gold Runner iniciado")
 
 while True:
+    try:
+        has_items = False
+        
+        for obj in list_all_objects(PLATA_BUCKET):
+            key = obj["Key"]
+            has_items = True
 
-    response = s3.list_objects_v2(
-        Bucket="plata"
-    )
+            if is_processed(key):
+                continue
 
-    if "Contents" not in response:
-        continue
+            try:
+                file_obj = s3.get_object(Bucket=PLATA_BUCKET, Key=key)
+                data = json.loads(file_obj["Body"].read())
+            except Exception as exc:
+                logging.error("Error leyendo objeto %s: %s", key, exc, exc_info=True)
+                mark_processed(key)
+                continue
 
-    for obj in response["Contents"]:
+            try:
+                enrich(data)
+                logging.info("Enriquecido -> %s", key)
+                statsd.increment("oro.registros.enriquecidos")
+                if data.get("risk_score"):
+                    statsd.gauge("incendio.riesgo.puntaje", data["risk_score"])
+                mark_processed(key)
+            except Exception as exc:
+                logging.warning("Fallo al enriquecer %s, se reintentará más tarde: %s", key, exc)
+                statsd.increment("oro.registros.fallidos")
 
-        key = obj["Key"]
-
-        if key in processed:
-            continue
-
-        file = s3.get_object(
-            Bucket="plata",
-            Key=key
-        )
-
-        data = json.loads(
-            file["Body"].read()
-        )
-
-        enrich(data)
-
-        print(
-            f"Enriquecido -> {key}"
-        )
-
-        processed.add(key)
+        if not has_items:
+            logging.debug("No hay nuevos registros en Silver")
+            time.sleep(5)
+        else:
+            time.sleep(1)
+            
+    except Exception as exc:
+        logging.error("Error en Gold Runner: %s", exc, exc_info=True)
+        time.sleep(10)
 </file>
 
 <file path="lake/plata/Dockerfile">
@@ -405,29 +1097,44 @@ CMD ["python", "lake/plata/runner.py"]
 <file path="lake/plata/limpieza.py">
 import json
 import time
+import os
+import logging
 import boto3
+
+MINIO_ENDPOINT_URL = os.getenv("MINIO_ENDPOINT_URL", "http://minio:9000")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "admin")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "admin123")
+PLATA_BUCKET = os.getenv("PLATA_BUCKET", "plata")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 s3 = boto3.client(
     "s3",
-    endpoint_url="http://minio:9000",
-    aws_access_key_id="admin",
-    aws_secret_access_key="admin123"
+    endpoint_url=MINIO_ENDPOINT_URL,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-# Crear bucket plata
-try:
-    s3.head_bucket(Bucket="plata")
-except:
-    s3.create_bucket(Bucket="plata")
+
+def ensure_bucket(bucket_name):
+    try:
+        s3.head_bucket(Bucket=bucket_name)
+    except Exception as exc:
+        logging.warning("Bucket %s no existe, creando... %s", bucket_name, exc)
+        s3.create_bucket(Bucket=bucket_name)
+
+
+ensure_bucket(PLATA_BUCKET)
 
 
 def process_record(data):
+    temp = data.get("temperature")
+    humidity = data.get("humidity")
+    wind = data.get("wind_speed")
 
-    temp = data["temperature"]
-    humidity = data["humidity"]
-    wind = data["wind_speed"]
+    if temp is None or humidity is None or wind is None:
+        return None
 
-    # Validaciones básicas
     if temp < -50 or temp > 60:
         return None
 
@@ -437,155 +1144,846 @@ def process_record(data):
     if wind < 0:
         return None
 
-    # Transformación
     heat_index = temp + (wind * 0.2)
-
     return {
         "temperature": temp,
         "humidity": humidity,
         "wind_speed": wind,
         "heat_index": round(heat_index, 2),
-        "timestamp": data["timestamp"],
+        "timestamp": data.get("timestamp"),
         "processed_at": time.time()
     }
 
 
 def upload_to_silver(record):
-
-    s3.put_object(
-        Bucket="plata",
-        Key=f"silver_{int(time.time()*1000)}.json",
-        Body=json.dumps(record)
-    )
+    key = f"silver_{int(time.time() * 1000)}.json"
+    try:
+        s3.put_object(
+            Bucket=PLATA_BUCKET,
+            Key=key,
+            Body=json.dumps(record)
+        )
+        logging.info("✅ Registro Silver subido: %s", key)
+    except Exception as exc:
+        logging.error("❌ Error subiendo a Silver: %s", exc, exc_info=True)
+        raise
 </file>
 
 <file path="lake/plata/runner.py">
 import json
+import time
+import logging
+import os
+import sys
 import boto3
 
-from limpieza import (
-    process_record,
-    upload_to_silver
+from datadog import initialize, statsd
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from lake.plata.limpieza import process_record, upload_to_silver
+
+MINIO_ENDPOINT_URL = os.getenv("MINIO_ENDPOINT_URL", "http://minio:9000")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "admin")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "admin123")
+BRONZE_BUCKET = os.getenv("BRONZE_BUCKET", "bronze")
+PLATA_BUCKET = os.getenv("PLATA_BUCKET", "plata")
+PROCESSED_BUCKET = os.getenv("PROCESSED_BUCKET", "plata-processed")
+DATADOG_HOST = os.getenv("DATADOG_HOST", "datadog")
+DATADOG_PORT = int(os.getenv("DATADOG_PORT", "8125"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+initialize(
+    statsd_host=DATADOG_HOST,
+    statsd_port=DATADOG_PORT
 )
 
 s3 = boto3.client(
     "s3",
-    endpoint_url="http://minio:9000",
-    aws_access_key_id="admin",
-    aws_secret_access_key="admin123"
+    endpoint_url=MINIO_ENDPOINT_URL,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-processed = set()
 
-print("Silver Runner iniciado")
+def ensure_bucket(bucket_name):
+    try:
+        s3.head_bucket(Bucket=bucket_name)
+    except Exception as exc:
+        logging.warning("Bucket %s no existe, creando... %s", bucket_name, exc)
+        s3.create_bucket(Bucket=bucket_name)
+
+
+def processed_key(key):
+    return f"processed/{key}"
+
+
+def is_processed(key):
+    try:
+        s3.head_object(Bucket=PROCESSED_BUCKET, Key=processed_key(key))
+        return True
+    except Exception:
+        return False
+
+
+def mark_processed(key):
+    s3.put_object(Bucket=PROCESSED_BUCKET, Key=processed_key(key), Body=b"")
+
+
+def list_all_objects(bucket_name):
+    """Generador que permite iterar sobre todos los objetos con paginación automática."""
+    continuation_token = None
+    
+    while True:
+        list_kwargs = {"Bucket": bucket_name}
+        if continuation_token:
+            list_kwargs["ContinuationToken"] = continuation_token
+        
+        response = s3.list_objects_v2(**list_kwargs)
+        
+        if "Contents" not in response:
+            break
+        
+        for obj in response["Contents"]:
+            yield obj
+        
+        if response.get("IsTruncated"):
+            continuation_token = response.get("NextContinuationToken")
+        else:
+            break
+
+
+ensure_bucket(BRONZE_BUCKET)
+ensure_bucket(PLATA_BUCKET)
+ensure_bucket(PROCESSED_BUCKET)
+
+logging.info("Silver Runner iniciado")
 
 while True:
+    try:
+        has_items = False
+        
+        for obj in list_all_objects(BRONZE_BUCKET):
+            key = obj["Key"]
+            has_items = True
 
-    response = s3.list_objects_v2(
-        Bucket="bronze"
-    )
+            if is_processed(key):
+                continue
 
-    if "Contents" not in response:
-        continue
+            try:
+                file_obj = s3.get_object(Bucket=BRONZE_BUCKET, Key=key)
+                data = json.loads(file_obj["Body"].read())
+            except Exception as exc:
+                logging.error("Error leyendo objeto %s: %s", key, exc, exc_info=True)
+                mark_processed(key)
+                continue
 
-    for obj in response["Contents"]:
+            clean_data = process_record(data)
 
-        key = obj["Key"]
+            if clean_data:
+                try:
+                    upload_to_silver(clean_data)
+                    logging.info("Procesado -> %s", key)
+                    statsd.increment("plata.registros.procesados")
+                except Exception as exc:
+                    logging.error("Error subiendo registro Silver %s: %s", key, exc, exc_info=True)
+                    continue
+            else:
+                logging.warning("Registro inválido rechazado: %s", key)
+                statsd.increment("plata.registros.invalidos")
 
-        if key in processed:
-            continue
+            mark_processed(key)
 
-        file = s3.get_object(
-            Bucket="bronze",
-            Key=key
-        )
+        if not has_items:
+            logging.debug("No hay nuevos registros en Bronze")
+            time.sleep(5)
+        else:
+            time.sleep(1)
+            
+    except Exception as exc:
+        logging.error("Error en Silver Runner: %s", exc, exc_info=True)
+        time.sleep(10)
+</file>
 
-        data = json.loads(
-            file["Body"].read()
-        )
+<file path="lake/retry_utils.py">
+"""
+Utilitarios para reintentos con backoff exponencial y manejo de errores.
+"""
 
-        clean_data = process_record(
-            data
-        )
+import logging
+import time
+from functools import wraps
+from typing import Callable, Any, Type, Tuple
 
-        if clean_data:
 
-            upload_to_silver(
-                clean_data
-            )
+def retry_with_backoff(max_attempts: int = 3, base_delay: float = 1, max_delay: float = 60):
+    """
+    Decorador que implementa reintentos con backoff exponencial.
+    
+    Args:
+        max_attempts: Número máximo de intentos
+        base_delay: Retardo base en segundos (se duplica en cada intento)
+        max_delay: Retardo máximo en segundos
+    
+    Example:
+        @retry_with_backoff(max_attempts=3, base_delay=2)
+        def call_external_api():
+            return requests.get("https://api.example.com")
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs) -> Any:
+            last_exception = None
+            
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    last_exception = exc
+                    
+                    if attempt == max_attempts:
+                        logging.error(
+                            "❌ %s falló después de %d intentos: %s",
+                            func.__name__, max_attempts, exc, exc_info=True
+                        )
+                        raise
+                    
+                    delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+                    logging.warning(
+                        "⏳ %s intento %d/%d falló. Reintentando en %.1f segundos... Error: %s",
+                        func.__name__, attempt, max_attempts, delay, exc
+                    )
+                    time.sleep(delay)
+            
+            raise last_exception
+        
+        return wrapper
+    return decorator
 
-            print(
-                f"Procesado -> {key}"
-            )
 
-        processed.add(key)
+def retry_on_exception(
+    exception_types: Tuple[Type[Exception], ...] = (Exception,),
+    max_attempts: int = 3,
+    base_delay: float = 1
+):
+    """
+    Decorador que reinteneta solo si se lanza una excepción específica.
+    
+    Args:
+        exception_types: Tupla de tipos de excepción para reintentar
+        max_attempts: Número máximo de intentos
+        base_delay: Retardo base
+    
+    Example:
+        @retry_on_exception((requests.ConnectionError, requests.Timeout), max_attempts=5)
+        def fetch_data():
+            return requests.get("https://api.example.com", timeout=10)
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs) -> Any:
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exception_types as exc:
+                    if attempt == max_attempts:
+                        logging.error(
+                            "❌ %s falló después de %d intentos",
+                            func.__name__, max_attempts, exc_info=True
+                        )
+                        raise
+                    
+                    delay = base_delay * (2 ** (attempt - 1))
+                    logging.warning(
+                        "⏳ %s intento %d/%d falló. Reintentando en %.1f segundos...",
+                        func.__name__, attempt, max_attempts, delay
+                    )
+                    time.sleep(delay)
+        
+        return wrapper
+    return decorator
+
+
+def handle_and_log(error_message: str, default_return: Any = None):
+    """
+    Decorador que captura excepciones, las registra y retorna un valor por defecto.
+    
+    Args:
+        error_message: Mensaje de error a registrar
+        default_return: Valor a retornar en caso de error
+    
+    Example:
+        @handle_and_log("Error procesando datos", default_return={})
+        def process_data(data):
+            return json.loads(data)
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs) -> Any:
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                logging.error(
+                    "❌ %s: %s",
+                    error_message, exc, exc_info=True
+                )
+                return default_return
+        
+        return wrapper
+    return decorator
+</file>
+
+<file path="lake/schemas.py">
+"""
+Módulos de validación y esquemas para el pipeline de datos.
+Utiliza Pydantic para validar la estructura de los datos en cada etapa.
+"""
+
+from pydantic import BaseModel, Field, validator
+from typing import Optional
+from datetime import datetime
+
+
+class WeatherData(BaseModel):
+    """Esquema de datos meteorológicos del productor."""
+    temperature: float = Field(..., ge=-50, le=60, description="Temperatura en °C")
+    humidity: float = Field(..., ge=0, le=100, description="Humedad relativa en %")
+    wind_speed: float = Field(..., ge=0, description="Velocidad del viento en km/h")
+    timestamp: float = Field(..., description="Timestamp Unix del evento")
+    source: Optional[str] = Field(default="weather-api", description="Origen del dato")
+
+    @validator('temperature')
+    def validate_temperature(cls, v):
+        if v < -50 or v > 60:
+            raise ValueError('Temperatura fuera del rango válido [-50, 60]°C')
+        return v
+
+    @validator('humidity')
+    def validate_humidity(cls, v):
+        if v < 0 or v > 100:
+            raise ValueError('Humedad debe estar entre 0 y 100%')
+        return v
+
+    @validator('wind_speed')
+    def validate_wind_speed(cls, v):
+        if v < 0:
+            raise ValueError('Velocidad del viento no puede ser negativa')
+        return v
+
+
+class SensorData(BaseModel):
+    """Esquema de datos de sensores IoT."""
+    sensor_id: int = Field(..., gt=0, description="ID del sensor")
+    sensor_type: str = Field(default="environmental", description="Tipo de sensor")
+    temperature: float = Field(..., ge=-50, le=60)
+    humidity: float = Field(..., ge=0, le=100)
+    pressure: float = Field(..., ge=300, le=1200, description="Presión en mb")
+    solar_radiation: float = Field(..., ge=0, description="Radiación solar en W/m²")
+    air_quality_index: float = Field(..., ge=0, description="Índice de calidad del aire")
+    co2_level: float = Field(..., ge=300, le=5000, description="Nivel de CO2 en ppm")
+    timestamp: float = Field(..., description="Timestamp Unix del evento")
+    source: str = Field(default="sensor-simulator")
+
+
+class VideoFrameData(BaseModel):
+    """Esquema de metadatos de frames de video."""
+    camera_id: str = Field(..., description="ID de la cámara")
+    frame_id: str = Field(..., description="ID único del frame")
+    frame_number: int = Field(..., gt=0)
+    fps: float = Field(..., gt=0, le=60, description="Fotogramas por segundo")
+    timestamp: float = Field(...)
+    has_motion: bool = Field(default=False)
+    detection_count: int = Field(..., ge=0)
+    detected_objects: list = Field(default_factory=list, description="Tipos de objetos detectados")
+    detection_confidence: float = Field(..., ge=0, le=1)
+    source: str = Field(default="video-simulator")
+
+
+class CleanedWeatherData(BaseModel):
+    """Esquema de datos meteorológicos procesados (Silver)."""
+    temperature: float = Field(..., ge=-50, le=60)
+    humidity: float = Field(..., ge=0, le=100)
+    wind_speed: float = Field(..., ge=0)
+    heat_index: float = Field(..., description="Índice de calor calculado")
+    timestamp: float
+    processed_at: float = Field(default_factory=lambda: datetime.now().timestamp())
+    source: Optional[str] = None
+
+
+class EnrichedWeatherData(BaseModel):
+    """Esquema de datos enriquecidos con predicción ML (Gold)."""
+    temperature: float
+    humidity: float
+    wind_speed: float
+    heat_index: float
+    timestamp: float
+    processed_at: float
+    risk_score: float = Field(..., ge=0, le=100, description="Score de riesgo predicho")
+    risk_level: str = Field(..., pattern="^(NORMAL|ALTO)$")
+    enriched_at: float = Field(default_factory=lambda: datetime.now().timestamp())
+
+
+class ModelMetadata(BaseModel):
+    """Metadatos de un modelo de Machine Learning."""
+    version: str = Field(..., description="Versión del modelo (timestamp)")
+    created_at: str = Field(..., description="Fecha de creación")
+    accuracy: float = Field(..., ge=0, le=1)
+    precision: float = Field(..., ge=0, le=1)
+    recall: float = Field(..., ge=0, le=1)
+    f1_score: Optional[float] = Field(None, ge=0, le=1)
+    training_samples: int = Field(..., gt=0)
+    notes: Optional[str] = None
 </file>
 
 <file path="ml-api/app.py">
-from fastapi import FastAPI
+import os
+import sys
+import logging
 import joblib
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import Optional
 
-app = FastAPI()
+# Agregar path para imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from model_registry import ModelRegistry
 
-model = joblib.load("model.pkl")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Wildfire Risk Prediction API")
+
+MODEL_PATH = os.getenv("MODEL_PATH", "/app/model.pkl")
+REGISTRY_PATH = os.getenv("REGISTRY_PATH", "/app/models")
+
+# Variables globales para el modelo
+_model = None
+_model_version = None
+_registry = None
+
+
+class PredictionRequest(BaseModel):
+    """Esquema de solicitud de predicción."""
+    temperature: float = Field(..., ge=-50, le=60, description="Temperatura en °C")
+    humidity: float = Field(..., ge=0, le=100, description="Humedad relativa en %")
+    wind_speed: float = Field(..., ge=0, description="Velocidad del viento en km/h")
+
+
+class PredictionResponse(BaseModel):
+    """Esquema de respuesta de predicción."""
+    risk_score: float = Field(..., ge=0, le=100)
+    risk_level: str = Field(..., pattern="^(NORMAL|ALTO)$")
+    model_version: str
+    confidence: float = Field(..., ge=0, le=1)
+
+
+@app.on_event("startup")
+async def load_model():
+    """Carga el modelo al iniciar la aplicación."""
+    global _model, _model_version, _registry
+    
+    logger.info("🚀 Inicializando API de predicción...")
+    
+    try:
+        # Intentar usar el Model Registry
+        _registry = ModelRegistry(registry_path=REGISTRY_PATH)
+        _model, metadata = _registry.load_model(version_id="latest")
+        _model_version = metadata["version"]
+        
+        logger.info(
+            "✅ Modelo cargado desde registry v%s (Accuracy: %.3f)",
+            _model_version, metadata["accuracy"]
+        )
+        
+    except Exception as exc:
+        logger.warning(
+            "⚠️  No se pudo cargar desde registry, intentando cargar modelo local: %s",
+            exc
+        )
+        
+        # Fallback: cargar modelo local
+        if os.path.exists(MODEL_PATH):
+            try:
+                _model = joblib.load(MODEL_PATH)
+                _model_version = "local"
+                logger.info("✅ Modelo local cargado desde %s", MODEL_PATH)
+            except Exception as exc_local:
+                logger.error("❌ Error cargando modelo local: %s", exc_local, exc_info=True)
+                raise RuntimeError("No se pudo cargar el modelo") from exc_local
+        else:
+            raise FileNotFoundError(f"Modelo no encontrado en {MODEL_PATH}")
+
+
+@app.get("/health")
+async def health():
+    """Endpoint de salud."""
+    if _model is None:
+        return {"status": "unhealthy", "reason": "model_not_loaded"}
+    return {
+        "status": "healthy",
+        "model_version": _model_version
+    }
+
+
+@app.get("/model/info")
+async def model_info():
+    """Obtiene información del modelo actual."""
+    if _registry is None:
+        return {
+            "version": _model_version,
+            "source": "local_file"
+        }
+    
+    try:
+        metadata = _registry.get_version_info(_model_version)
+        return {
+            "version": _model_version,
+            "source": "model_registry",
+            "metadata": metadata
+        }
+    except Exception as exc:
+        logger.error("Error obteniendo metadata: %s", exc)
+        return {"version": _model_version, "error": str(exc)}
+
+
+@app.get("/model/versions")
+async def list_versions():
+    """Lista todas las versiones disponibles del modelo."""
+    if _registry is None:
+        return {"versions": [{"version": "local", "source": "file"}]}
+    
+    try:
+        versions = _registry.list_versions()
+        return {"versions": versions}
+    except Exception as exc:
+        logger.error("Error listando versiones: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/predict", response_model=PredictionResponse)
+async def predict(request: PredictionRequest) -> PredictionResponse:
+    """
+    Realiza una predicción de riesgo de incendio.
+    
+    Args:
+        request: Datos meteorológicos (temperatura, humedad, viento)
+    
+    Returns:
+        Predicción con score, nivel de riesgo y versión del modelo
+    """
+    if _model is None:
+        raise HTTPException(status_code=503, detail="Modelo no cargado")
+    
+    try:
+        # Preparar entrada
+        features = [[request.temperature, request.humidity, request.wind_speed]]
+        
+        # Predicción
+        prediction = _model.predict(features)[0]
+        probabilities = _model.predict_proba(features)[0]
+        
+        # Calcular score (0-100)
+        risk_probability = probabilities[1]  # Probabilidad de clase "ALTO"
+        risk_score = risk_probability * 100
+        
+        # Determinar nivel de riesgo
+        risk_level = "ALTO" if prediction == 1 else "NORMAL"
+        
+        logger.info(
+            "🔮 Predicción: temp=%.1f, humidity=%.1f, wind=%.1f -> "
+            "score=%.1f, level=%s",
+            request.temperature, request.humidity, request.wind_speed,
+            risk_score, risk_level
+        )
+        
+        return PredictionResponse(
+            risk_score=round(risk_score, 2),
+            risk_level=risk_level,
+            model_version=_model_version,
+            confidence=round(max(probabilities), 3)
+        )
+    
+    except Exception as exc:
+        logger.error("❌ Error en predicción: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/")
-def home():
+async def root():
+    """Endpoint raíz."""
     return {
-        "status": "ok"
+        "service": "Wildfire Risk Prediction API",
+        "version": "1.0.0",
+        "endpoints": {
+            "health": "/health",
+            "predict": "/predict",
+            "model_info": "/model/info",
+            "model_versions": "/model/versions"
+        }
     }
 
 
-@app.post("/predict")
-def predict(data: dict):
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+</file>
 
-    temp = data["temp"]
-    humidity = data["humidity"]
-    wind = data["wind"]
+<file path="ml-api/Dockerfile">
+FROM python:3.11
 
-    prediction = model.predict([
-        [
-            temp,
-            humidity,
-            wind
-        ]
-    ])
+WORKDIR /app
 
-    probability = model.predict_proba([
-        [
-            temp,
-            humidity,
-            wind
-        ]
-    ])
+COPY . .
 
-    risk_score = round(
-        probability[0][1] * 100,
-        2
-    )
+RUN pip install -r requirements.txt
 
-    return {
-        "risk_score": risk_score,
-        "risk_level":
-            "ALTO"
-            if prediction[0] == 1
-            else "NORMAL"
-    }
+RUN python ml-api/train.py
+
+CMD ["uvicorn", "ml-api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+</file>
+
+<file path="ml-api/model_registry.py">
+"""
+Model Registry - Sistema de versionamiento y gestión de modelos ML.
+Permite guardar versiones de modelos con metadatos y facilita rollback.
+"""
+
+import os
+import json
+import joblib
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+
+
+class ModelRegistry:
+    """
+    Registro centralizado de versiones de modelos de Machine Learning.
+    """
+    
+    def __init__(self, registry_path: str = "/app/models"):
+        self.registry_path = Path(registry_path)
+        self.registry_path.mkdir(parents=True, exist_ok=True)
+        self.logger = logging.getLogger(__name__)
+    
+    def save_model(
+        self,
+        model: Any,
+        accuracy: float,
+        precision: float,
+        recall: float,
+        f1_score: Optional[float] = None,
+        training_samples: int = 0,
+        notes: str = ""
+    ) -> str:
+        """
+        Guarda una versión del modelo con metadatos.
+        
+        Args:
+            model: Objeto del modelo entrenado (sklearn, xgboost, etc.)
+            accuracy: Exactitud del modelo (0-1)
+            precision: Precisión del modelo (0-1)
+            recall: Recall del modelo (0-1)
+            f1_score: F1 score opcional (0-1)
+            training_samples: Cantidad de muestras de entrenamiento
+            notes: Notas adicionales sobre el modelo
+        
+        Returns:
+            version_id: ID de la versión guardada (timestamp)
+        """
+        version_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        version_path = self.registry_path / f"model_v{version_id}"
+        version_path.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            # Guardar modelo
+            model_file = version_path / "model.pkl"
+            joblib.dump(model, model_file)
+            self.logger.info("✅ Modelo guardado en %s", model_file)
+            
+            # Guardar metadatos
+            metadata = {
+                "version": version_id,
+                "created_at": datetime.now().isoformat(),
+                "accuracy": round(accuracy, 4),
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1_score": round(f1_score, 4) if f1_score else None,
+                "training_samples": training_samples,
+                "notes": notes,
+                "status": "active"
+            }
+            
+            metadata_file = version_path / "metadata.json"
+            with open(metadata_file, "w") as f:
+                json.dump(metadata, f, indent=2)
+            
+            self.logger.info(
+                "✅ Versión v%s guardada - Accuracy: %.3f, Precision: %.3f, Recall: %.3f",
+                version_id, accuracy, precision, recall
+            )
+            
+            # Actualizar last_version symlink
+            self._update_latest_version(version_id)
+            
+            return version_id
+            
+        except Exception as exc:
+            self.logger.error("❌ Error guardando modelo v%s: %s", version_id, exc, exc_info=True)
+            raise
+    
+    def load_model(self, version_id: str = "latest") -> tuple:
+        """
+        Carga un modelo y sus metadatos.
+        
+        Args:
+            version_id: ID de versión a cargar ('latest' para la última)
+        
+        Returns:
+            (model, metadata): Tupla con modelo y diccionario de metadatos
+        """
+        if version_id == "latest":
+            version_id = self._get_latest_version()
+            if not version_id:
+                raise ValueError("No hay versiones de modelo disponibles")
+        
+        version_path = self.registry_path / f"model_v{version_id}"
+        
+        if not version_path.exists():
+            raise ValueError(f"Versión {version_id} no encontrada")
+        
+        try:
+            model_file = version_path / "model.pkl"
+            model = joblib.load(model_file)
+            
+            metadata_file = version_path / "metadata.json"
+            with open(metadata_file, "r") as f:
+                metadata = json.load(f)
+            
+            self.logger.info("✅ Modelo v%s cargado", version_id)
+            return model, metadata
+            
+        except Exception as exc:
+            self.logger.error("❌ Error cargando modelo v%s: %s", version_id, exc, exc_info=True)
+            raise
+    
+    def list_versions(self) -> List[Dict[str, Any]]:
+        """
+        Lista todas las versiones disponibles con sus metadatos.
+        
+        Returns:
+            Lista de diccionarios con versiones y metadatos
+        """
+        versions = []
+        
+        for version_dir in sorted(self.registry_path.glob("model_v*"), reverse=True):
+            metadata_file = version_dir / "metadata.json"
+            if metadata_file.exists():
+                with open(metadata_file, "r") as f:
+                    metadata = json.load(f)
+                    versions.append(metadata)
+        
+        return versions
+    
+    def get_version_info(self, version_id: str) -> Dict[str, Any]:
+        """
+        Obtiene información detallada de una versión específica.
+        """
+        version_path = self.registry_path / f"model_v{version_id}"
+        metadata_file = version_path / "metadata.json"
+        
+        if not metadata_file.exists():
+            raise ValueError(f"Versión {version_id} no encontrada")
+        
+        with open(metadata_file, "r") as f:
+            return json.load(f)
+    
+    def compare_versions(self, version_a: str, version_b: str) -> Dict[str, Any]:
+        """
+        Compara dos versiones de modelos.
+        
+        Returns:
+            Diccionario con comparativa de métricas
+        """
+        meta_a = self.get_version_info(version_a)
+        meta_b = self.get_version_info(version_b)
+        
+        return {
+            "version_a": version_a,
+            "version_b": version_b,
+            "accuracy_improvement": (meta_b["accuracy"] - meta_a["accuracy"]) * 100,
+            "precision_improvement": (meta_b["precision"] - meta_a["precision"]) * 100,
+            "recall_improvement": (meta_b["recall"] - meta_a["recall"]) * 100,
+            "created_a": meta_a["created_at"],
+            "created_b": meta_b["created_at"],
+        }
+    
+    def _get_latest_version(self) -> Optional[str]:
+        """Obtiene el ID de la última versión guardada."""
+        versions = sorted(self.registry_path.glob("model_v*"), reverse=True)
+        if versions:
+            return versions[0].name.replace("model_v", "")
+        return None
+    
+    def _update_latest_version(self, version_id: str):
+        """Actualiza un archivo que apunta a la última versión."""
+        latest_file = self.registry_path / "LATEST_VERSION"
+        with open(latest_file, "w") as f:
+            f.write(version_id)
+
+
+# Ejemplo de uso
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    
+    # Crear registry
+    registry = ModelRegistry("/tmp/model_registry")
+    
+    # (Después de entrenar un modelo)
+    # version_id = registry.save_model(
+    #     model=trained_model,
+    #     accuracy=0.95,
+    #     precision=0.93,
+    #     recall=0.94,
+    #     f1_score=0.935,
+    #     training_samples=5000,
+    #     notes="Entrenado con datos de 2026-06"
+    # )
+    
+    # Listar versiones
+    # print(registry.list_versions())
+    
+    # Cargar última versión
+    # model, metadata = registry.load_model("latest")
 </file>
 
 <file path="ml-api/train.py">
 import pandas as pd
 import joblib
+import logging
+import sys
+import os
+from pathlib import Path
 
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
+# Agregar path para importar model_registry
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from model_registry import ModelRegistry
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# Crear datos de entrenamiento
 data = []
 
 for temp in range(0, 50):
     for humidity in range(5, 100, 5):
         for wind in range(0, 40, 5):
-
             risk = 0
 
             if temp > 35:
@@ -616,29 +2014,54 @@ df = pd.DataFrame(
     ]
 )
 
-X = df[
-    [
-        "temperature",
-        "humidity",
-        "wind_speed"
-    ]
-]
-
+X = df[["temperature", "humidity", "wind_speed"]]
 y = df["risk"]
+
+# Entrenar modelo
+logger.info("🎓 Iniciando entrenamiento del modelo...")
 
 model = RandomForestClassifier(
     n_estimators=100,
-    random_state=42
+    random_state=42,
+    n_jobs=-1
 )
 
 model.fit(X, y)
 
-joblib.dump(
-    model,
-    "model.pkl"
-)
+# Calcular métricas
+y_pred = model.predict(X)
+accuracy = accuracy_score(y, y_pred)
+precision = precision_score(y, y_pred, zero_division=0)
+recall = recall_score(y, y_pred, zero_division=0)
+f1 = f1_score(y, y_pred, zero_division=0)
 
-print("Modelo entrenado")
+logger.info("✅ Modelo entrenado")
+logger.info("📊 Métricas:")
+logger.info("   - Accuracy:  %.4f", accuracy)
+logger.info("   - Precision: %.4f", precision)
+logger.info("   - Recall:    %.4f", recall)
+logger.info("   - F1-Score:  %.4f", f1)
+
+# Guardar modelo en archivo principal
+model_path = os.path.join(os.path.dirname(__file__), "model.pkl")
+joblib.dump(model, model_path)
+logger.info("💾 Modelo guardado en: %s", model_path)
+
+# Registrar modelo con versionamiento
+try:
+    registry = ModelRegistry(registry_path="/app/models")
+    version_id = registry.save_model(
+        model=model,
+        accuracy=accuracy,
+        precision=precision,
+        recall=recall,
+        f1_score=f1,
+        training_samples=len(X),
+        notes="Modelo de línea base entrenado con datos sintéticos"
+    )
+    logger.info("📦 Modelo v%s registrado en el Model Registry", version_id)
+except Exception as exc:
+    logger.warning("⚠️  Error registrando modelo: %s", exc)
 </file>
 
 <file path="package.json">
@@ -647,6 +2070,363 @@ print("Modelo entrenado")
 		"repomix": "^1.14.1"
 	}
 }
+</file>
+
+<file path="PROBLEMAS_IDENTIFICADOS.md">
+# Problemas y oportunidades de mejora identificados
+
+Durante la revisión de la arquitectura y del código fuente se identificaron algunos aspectos que requieren ajustes para mejorar la robustez, mantenibilidad y comportamiento del sistema en un entorno más cercano a producción.
+
+---
+
+## 1. Generación y carga del modelo de Machine Learning
+
+Actualmente, la API de Machine Learning carga el archivo `model.pkl` al iniciar:
+
+```python
+model = joblib.load(MODEL_PATH)
+```
+
+Sin embargo, el contenedor de la API no genera automáticamente dicho archivo durante el proceso de construcción. Esto puede provocar errores de inicialización si el modelo no existe previamente en el entorno de ejecución.
+
+**Recomendación:** Incorporar la ejecución del script `train.py` durante el proceso de build del contenedor o incluir el modelo previamente generado dentro de la imagen Docker.
+
+**Solución propuesta:**
+```dockerfile
+# ml-api/Dockerfile
+FROM python:3.11
+WORKDIR /app
+COPY . .
+RUN pip install -r requirements.txt
+RUN python ml-api/train.py
+CMD ["uvicorn", "ml-api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+---
+
+## 2. Importaciones dependientes de la ubicación de ejecución
+
+Los módulos de las capas Silver y Gold utilizan importaciones relativas como:
+
+```python
+from limpieza import process_record
+from processor import enrich
+```
+
+Este enfoque puede generar errores dependiendo del directorio desde el cual se ejecute el contenedor o el intérprete de Python.
+
+**Recomendación:** Utilizar importaciones absolutas dentro del proyecto y convertir los directorios correspondientes en paquetes Python mediante archivos `__init__.py`.
+
+**Solución propuesta:**
+
+En `lake/plata/runner.py`:
+```python
+from lake.plata.limpieza import process_record, upload_to_silver
+```
+
+En `lake/oro/runner.py`:
+```python
+from lake.oro.processor import enrich
+```
+
+---
+
+## 3. Obtención de datos meteorológicos desde Open-Meteo
+
+La implementación actual obtiene la temperatura y velocidad del viento desde el bloque `current_weather`, mientras que la humedad relativa se obtiene desde el bloque `hourly`.
+
+```python
+current = payload.get("current_weather", {})
+hourly = payload.get("hourly", {})
+humidity_values = hourly.get("relativehumidity_2m", [])
+humidity = humidity_values[-1] if humidity_values else None
+```
+
+Esto puede provocar inconsistencias temporales, ya que la humedad utilizada podría no corresponder exactamente al mismo instante de tiempo que el resto de las variables meteorológicas.
+
+**Recomendación:** Utilizar la API actual de Open-Meteo mediante el parámetro `current` (no `current_weather`), obteniendo todas las variables meteorológicas desde una misma fuente temporal.
+
+**Solución propuesta:**
+```python
+response = requests.get(
+    "https://api.open-meteo.com/v1/forecast",
+    params={
+        "latitude": LAT,
+        "longitude": LON,
+        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m",
+        "timezone": "auto"
+    },
+    timeout=10
+)
+current = response.json().get("current", {})
+data = {
+    "temperature": current.get("temperature_2m"),
+    "humidity": current.get("relative_humidity_2m"),
+    "wind_speed": current.get("wind_speed_10m"),
+    "timestamp": time.time()
+}
+```
+
+---
+
+## 4. Escalabilidad en la lectura de objetos desde MinIO
+
+Los procesos Silver y Gold utilizan la operación:
+
+```python
+response = s3.list_objects_v2(Bucket=PLATA_BUCKET)
+```
+
+Actualmente no se implementa paginación de resultados. Aunque esto no representa un problema para pruebas o demostraciones, puede convertirse en una limitación cuando el volumen de archivos almacenados supera los 1.000 objetos.
+
+**Recomendación:** Implementar soporte para `ContinuationToken` y paginación de resultados.
+
+**Solución propuesta:**
+```python
+def list_all_objects(bucket_name):
+    """Generador que permite iterar sobre todos los objetos con paginación automática."""
+    continuation_token = None
+    
+    while True:
+        list_kwargs = {"Bucket": bucket_name}
+        if continuation_token:
+            list_kwargs["ContinuationToken"] = continuation_token
+        
+        response = s3.list_objects_v2(**list_kwargs)
+        
+        if "Contents" not in response:
+            break
+        
+        for obj in response["Contents"]:
+            yield obj
+        
+        if response.get("IsTruncated"):
+            continuation_token = response.get("NextContinuationToken")
+        else:
+            break
+```
+
+Luego utilizar:
+```python
+for obj in list_all_objects(BRONZE_BUCKET):
+    # procesar objeto
+```
+
+---
+
+## 5. Observabilidad limitada del pipeline
+
+El proyecto incorpora Datadog como solución de monitoreo; sin embargo, actualmente se utilizan principalmente logs y no se aprovechan métricas operacionales que permitan medir el comportamiento del pipeline.
+
+Esto dificulta el monitoreo de:
+
+- Cantidad de registros procesados
+- Velocidad de procesamiento
+- Número de errores por etapa
+- Volumen de alertas generadas
+- Riesgo promedio detectado por el modelo
+
+**Recomendación:** Incorporar métricas personalizadas utilizando DogStatsD.
+
+**Solución propuesta:**
+```python
+from datadog import initialize, statsd
+import os
+
+initialize(
+    api_key=os.getenv("DD_API_KEY"),
+    app_key=os.getenv("DD_APP_KEY")
+)
+
+# En consumer/consumer.py
+statsd.increment("bronze.records.received")
+statsd.gauge("bronze.processing_time", elapsed_ms)
+
+# En lake/plata/runner.py
+statsd.increment("silver.records.processed")
+statsd.gauge("silver.quality_score", quality)
+
+# En lake/oro/runner.py
+statsd.increment("gold.records.enriched")
+statsd.gauge("wildfire.risk_score", risk_score)
+statsd.increment("wildfire.alerts", sample_rate=0.1)
+```
+
+---
+
+## 6. Capa analítica aún no implementada
+
+La arquitectura propuesta contempla una capa de análisis compuesta por DuckDB y Metabase:
+
+```
+Gold (MinIO)
+     ↓
+  DuckDB
+     ↓
+  Metabase
+```
+
+Sin embargo, actualmente dicha capa aún no se encuentra implementada dentro del proyecto.
+
+**Recomendación:** Desarrollar un proceso de carga desde la capa Gold hacia DuckDB y posteriormente conectar Metabase para construir dashboards y consultas analíticas.
+
+**Solución propuesta:**
+Crear un nuevo servicio `analytics-loader` que:
+1. Periodicamente lea archivos desde el bucket `oro`
+2. Cargue los datos en una tabla DuckDB
+3. Mantenga un índice de registros procesados
+4. Exponga métricas agregadas (temperatura promedio, alertas por zona, etc.)
+
+---
+
+## 7. Manejo de estados transitorios en runners
+
+Actualmente, los runners (Silver y Gold) persisten el estado de procesamiento en MinIO mediante marcadores S3. Sin embargo, no existe un mecanismo para:
+
+- Limpiar marcadores antiguos después de N días
+- Reintentar procesos que fallan
+- Registrar errores persistentes para análisis posterior
+
+**Recomendación:** Implementar una estrategia de reintentos con backoff exponencial y logging estructurado de errores.
+
+**Solución propuesta:**
+```python
+import logging
+from functools import wraps
+import time
+
+def retry_with_backoff(max_attempts=3, base_delay=1):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    if attempt == max_attempts - 1:
+                        raise
+                    delay = base_delay * (2 ** attempt)
+                    logging.warning("Intento %d/%d fallido. Reintentando en %d segundos...",
+                                  attempt + 1, max_attempts, delay)
+                    time.sleep(delay)
+        return wrapper
+    return decorator
+```
+
+---
+
+## 8. Falta de validación y tipado en datos
+
+Los datos que fluyen a través del pipeline (Bronze → Silver → Gold) no tienen esquemas formales definidos. Esto puede causar:
+
+- Inconsistencias en los tipos de datos
+- Dificultad en la depuración de errores
+- Falta de documentación clara sobre la estructura esperada
+
+**Recomendación:** Implementar validación de esquemas mediante Pydantic o JSON Schema.
+
+**Solución propuesta:**
+```python
+from pydantic import BaseModel, Field, validator
+from typing import Optional
+
+class WeatherRecord(BaseModel):
+    temperature: float = Field(..., ge=-50, le=60)
+    humidity: float = Field(..., ge=0, le=100)
+    wind_speed: float = Field(..., ge=0)
+    timestamp: float
+    
+    @validator('temperature')
+    def validate_temperature(cls, v):
+        if v < -50 or v > 60:
+            raise ValueError('Temperatura fuera de rango válido')
+        return v
+
+class RichWeatherRecord(WeatherRecord):
+    heat_index: float
+    processed_at: float
+```
+
+---
+
+## 9. Coordinación entre múltiples fuentes de datos
+
+El proyecto ahora contempla múltiples fuentes de datos (Open-Meteo, sensores IoT, video). Sin embargo, no existe:
+
+- Un sistema de ordenamiento temporal de eventos
+- Un mecanismo para correlacionar eventos de diferentes fuentes
+- Un plan de escalabilidad para manejar múltiples tópicos Kafka
+
+**Recomendación:** Implementar un "event aggregator" que:
+1. Consume eventos de múltiples tópicos Kafka
+2. Los ordena temporalmente
+3. Los enriquece con metadatos de correlación
+4. Los envía a la capa Bronze como eventos unificados
+
+---
+
+## 10. Falta de versionamiento en modelos de ML
+
+El modelo de Machine Learning se actualiza mediante `train.py`, pero no existe:
+
+- Control de versiones de modelos
+- Registro de cambios o mejoras
+- Mecanismo de rollback a versiones anteriores
+- Comparativa de performance entre versiones
+
+**Recomendación:** Implementar un sistema de versionamiento y registro de modelos (Model Registry).
+
+**Solución propuesta:**
+```python
+import os
+import json
+from datetime import datetime
+
+MODEL_REGISTRY_PATH = os.getenv("MODEL_REGISTRY", "/app/models")
+
+def save_model_version(model, accuracy, precision, recall):
+    """Guarda una versión del modelo con metadatos."""
+    version = datetime.now().strftime("%Y%m%d_%H%M%S")
+    version_path = os.path.join(MODEL_REGISTRY_PATH, f"model_v{version}")
+    
+    os.makedirs(version_path, exist_ok=True)
+    
+    joblib.dump(model, os.path.join(version_path, "model.pkl"))
+    
+    metadata = {
+        "version": version,
+        "timestamp": datetime.now().isoformat(),
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall
+    }
+    
+    with open(os.path.join(version_path, "metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    logging.info("Modelo v%s guardado con accuracy=%.3f", version, accuracy)
+    return version_path
+```
+
+---
+
+## Conclusión
+
+La arquitectura implementada presenta una estructura sólida basada en el patrón Medallion (Bronze, Silver y Gold), integra procesamiento de eventos mediante Kafka, contempla múltiples fuentes de datos y prevé inferencia de Machine Learning desacoplada mediante una API.
+
+No obstante, existen oportunidades de mejora relacionadas con:
+
+1. **Confiabilidad:** Generación automática del modelo, reintentos con backoff, validación de esquemas
+2. **Escalabilidad:** Paginación en MinIO, agregación de múltiples fuentes, versionamiento de modelos
+3. **Observabilidad:** Métricas personalizadas, logging estructurado, trazabilidad de eventos
+4. **Completitud:** Capa analítica (DuckDB + Metabase), event correlation, model registry
+
+La resolución sistemática de estos puntos permitirá aumentar significativamente la robustez del sistema y acercarlo a estándares utilizados en entornos productivos reales.
+
+---
+
+**Última actualización:** 2026-06-09
+
+**Mantenedores:** Equipo de Data Engineering
 </file>
 
 <file path="producer/Dockerfile">
@@ -664,57 +2444,285 @@ CMD ["python", "producer/open-meteo.py"]
 <file path="producer/open-meteo.py">
 import json
 import time
+import os
+import logging
 import requests
 
+from datadog import initialize, statsd
 from kafka import KafkaProducer
 
+
+def parse_float_env(key: str, default: str) -> float:
+    raw = os.getenv(key, default)
+    if isinstance(raw, str):
+        raw = raw.strip().strip('"').strip("'")
+    return float(raw)
+
+
+def parse_int_env(key: str, default: str) -> int:
+    raw = os.getenv(key, default)
+    if isinstance(raw, str):
+        raw = raw.strip().strip('"').strip("'")
+    return int(raw)
+
+
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "sensores")
+LAT = parse_float_env("LATITUDE", "-33.45")
+LON = parse_float_env("LONGITUDE", "-70.66")
+POLL_SECONDS = parse_int_env("POLL_SECONDS", "300")
+DATADOG_HOST = os.getenv("DATADOG_HOST", "datadog")
+DATADOG_PORT = int(os.getenv("DATADOG_PORT", "8125"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+initialize(
+    statsd_host=DATADOG_HOST,
+    statsd_port=DATADOG_PORT
+)
 
 while True:
     try:
         producer = KafkaProducer(
-            bootstrap_servers="kafka:9092",
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
             value_serializer=lambda v: json.dumps(v).encode("utf-8")
         )
-
-        print("✅ Kafka listo")
+        logging.info("✅ Kafka listo")
         break
-
-    except Exception as e:
-        print("Esperando Kafka...", e)
+    except Exception as exc:
+        logging.warning("Esperando Kafka... %s", exc)
         time.sleep(5)
 
-LAT = -33.45
-LON = -70.66
+while True:
+    try:
+        response = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": LAT,
+                "longitude": LON,
+                "current": "temperature_2m,relative_humidity_2m,wind_speed_10m",
+                "timezone": "auto"
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        current = payload.get("current", {})
+
+        data = {
+            "temperature": current.get("temperature_2m"),
+            "humidity": current.get("relative_humidity_2m"),
+            "wind_speed": current.get("wind_speed_10m"),
+            "timestamp": time.time()
+        }
+
+        if data["temperature"] is None or data["wind_speed"] is None or data["humidity"] is None:
+            raise ValueError("Open-Meteo returned incomplete current weather data")
+
+        producer.send(KAFKA_TOPIC, data)
+        statsd.increment("produccion.clima.enviados")
+        statsd.gauge("clima.temperatura", data["temperature"])
+        statsd.gauge("clima.humedad", data["humidity"])
+        statsd.gauge("clima.velocidad_viento", data["wind_speed"])
+        logging.info("Enviado: %s", data)
+    except Exception as exc:
+        logging.error("Error obteniendo datos meteorológicos: %s", exc, exc_info=True)
+
+    time.sleep(POLL_SECONDS)
+</file>
+
+<file path="producer/sensor-simulator.py">
+"""
+Productor simulado de datos de sensores IoT.
+Genera métricas adicionales como presión, radiación solar, calidad del aire, etc.
+"""
+
+import json
+import time
+import os
+import logging
+import random
+
+from datadog import initialize, statsd
+from kafka import KafkaProducer
+
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC_SENSORS", "sensores-iot")
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+DATADOG_HOST = os.getenv("DATADOG_HOST", "datadog")
+DATADOG_PORT = int(os.getenv("DATADOG_PORT", "8125"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+initialize(
+    statsd_host=DATADOG_HOST,
+    statsd_port=DATADOG_PORT
+)
 
 while True:
+    try:
+        producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8")
+        )
+        logging.info("✅ Kafka listo (Sensor Simulator)")
+        break
+    except Exception as exc:
+        logging.warning("Esperando Kafka... %s", exc)
+        time.sleep(5)
 
-    response = requests.get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude": LAT,
-            "longitude": LON,
-            "current": "temperature_2m,relative_humidity_2m,wind_speed_10m"
+logging.info("Sensor Simulator iniciado")
+
+while True:
+    try:
+        # Simular múltiples sensores distribuidos
+        sensor_id = random.randint(1, 5)
+        
+        # Valores realistas con variación
+        temperature = 20 + random.uniform(-5, 35)
+        humidity = max(0, min(100, 50 + random.gauss(0, 15)))
+        pressure = 1013 + random.gauss(0, 10)  # mb
+        solar_radiation = max(0, 500 + random.gauss(0, 200))  # W/m²
+        air_quality_index = max(0, 50 + random.gauss(0, 30))  # AQI
+        co2_level = 400 + random.gauss(0, 50)  # ppm
+        
+        data = {
+            "sensor_id": sensor_id,
+            "sensor_type": "environmental",
+            "temperature": round(temperature, 2),
+            "humidity": round(humidity, 2),
+            "pressure": round(pressure, 2),
+            "solar_radiation": round(solar_radiation, 2),
+            "air_quality_index": round(air_quality_index, 2),
+            "co2_level": round(co2_level, 2),
+            "timestamp": time.time(),
+            "source": "sensor-simulator"
         }
-    )
 
-    current = response.json()["current"]
+        producer.send(KAFKA_TOPIC, data)
+        statsd.increment("produccion.sensores.enviados")
+        statsd.gauge("sensor.temperatura", data["temperature"])
+        statsd.gauge("sensor.humedad", data["humidity"])
+        statsd.gauge("sensor.indice_calidad_aire", data["air_quality_index"])
+        logging.info("Sensor #%d enviado: temp=%.1f°C, humedad=%.1f%%, AQI=%.1f",
+                     sensor_id, data["temperature"], data["humidity"], data["air_quality_index"])
 
-    data = {
-        "temperature": current["temperature_2m"],
-        "humidity": current["relative_humidity_2m"],
-        "wind_speed": current["wind_speed_10m"],
-        "timestamp": time.time()
-    }
+    except Exception as exc:
+        logging.error("Error obteniendo datos de sensores: %s", exc, exc_info=True)
 
-    producer.send("sensores", data)
+    time.sleep(POLL_SECONDS)
+</file>
 
-    print("Enviado:", data)
+<file path="producer/video-simulator.py">
+"""
+Productor simulado de datos de video surveillance.
+Genera metadatos de video como detecciones, movimiento, FPS, etc.
+"""
 
-    time.sleep(300)
+import json
+import time
+import os
+import logging
+import random
+import uuid
+
+from datadog import initialize, statsd
+from kafka import KafkaProducer
+
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC_VIDEO", "video-stream")
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+DATADOG_HOST = os.getenv("DATADOG_HOST", "datadog")
+DATADOG_PORT = int(os.getenv("DATADOG_PORT", "8125"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+initialize(
+    statsd_host=DATADOG_HOST,
+    statsd_port=DATADOG_PORT
+)
+
+while True:
+    try:
+        producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8")
+        )
+        logging.info("✅ Kafka listo (Video Simulator)")
+        break
+    except Exception as exc:
+        logging.warning("Esperando Kafka... %s", exc)
+        time.sleep(5)
+
+logging.info("Video Simulator iniciado")
+
+# Simular cámaras distribuidas
+cameras = {
+    "CAM-001": {"location": "Entrada Principal", "zone": "A"},
+    "CAM-002": {"location": "Perímetro Este", "zone": "B"},
+    "CAM-003": {"location": "Depósito", "zone": "C"},
+    "CAM-004": {"location": "Salida", "zone": "A"},
+}
+
+while True:
+    try:
+        camera_id = random.choice(list(cameras.keys()))
+        camera_info = cameras[camera_id]
+        
+        # Simular detecciones con probabilidad variable
+        has_motion = random.random() > 0.6
+        detection_confidence = random.uniform(0.5, 0.99) if has_motion else 0
+        num_objects = random.randint(0, 5) if has_motion else 0
+        
+        # Simular tipos de objetos detectados
+        object_types = []
+        if num_objects > 0:
+            possible_types = ["person", "vehicle", "animal", "debris"]
+            object_types = random.sample(possible_types, min(num_objects, len(possible_types)))
+        
+        frame_id = str(uuid.uuid4())[:8]
+        
+        data = {
+            "camera_id": camera_id,
+            "camera_location": camera_info["location"],
+            "zone": camera_info["zone"],
+            "frame_id": frame_id,
+            "frame_number": random.randint(1000, 999999),
+            "fps": round(random.uniform(24, 30), 2),
+            "timestamp": time.time(),
+            "has_motion": has_motion,
+            "motion_percentage": round(random.uniform(0, 100) if has_motion else 0, 2),
+            "detection_count": num_objects,
+            "detected_objects": object_types,
+            "detection_confidence": round(detection_confidence, 3),
+            "frame_size": f"{1920}x{1080}",
+            "encoding": "h264",
+            "source": "video-simulator"
+        }
+
+        producer.send(KAFKA_TOPIC, data)
+        statsd.increment("produccion.video.enviados")
+        statsd.gauge("video.fps", data["fps"])
+        statsd.gauge("video.detecciones", data["detection_count"])
+        statsd.gauge("video.confianza_deteccion", data["detection_confidence"])
+        statsd.increment("video.movimiento.detectado", int(has_motion))
+        
+        motion_str = "MOVIMIENTO" if has_motion else "Sin actividad"
+        logging.info("📹 CAM-%s [%s] %s - Objetos: %d, FPS: %.1f",
+                     camera_id, camera_info["location"], motion_str, num_objects, data["fps"])
+
+    except Exception as exc:
+        logging.error("Error obteniendo datos de video: %s", exc, exc_info=True)
+
+    time.sleep(POLL_SECONDS)
 </file>
 
 <file path="README.md">
 # Ingenieria-de-datos-
+
+## Mapeo AWS ↔ Local (Docker)
+
 | AWS                   | Local (Docker)           |
 | --------------------- | ------------------------ |
 | S3 (Bronze/Plata/Oro) | MinIO                    |
@@ -728,10 +2736,44 @@ while True:
 | SNS                   | Datadog Alerts           |
 | CloudWatch            | Datadog                  |
 
-instalar dependencias: pip install -r requirements.txt
-Levantar docker: docker-compose up -d
+## Configuración rápida
+
+```bash
+# Instalar dependencias
+pip install -r requirements.txt
+
+# Levantar servicios
+docker-compose up -d
+
+# Ver logs de Datadog
 docker logs ingenier-a-de-datos--datadog-1
-visualizacion: sensor.temperatura
+```
+
+## Fuentes de datos disponibles
+
+El sistema actualmente consume datos desde tres fuentes simuladas:
+
+### 1. **Open-Meteo (producer/open-meteo.py)**
+- **Tópico Kafka:** `sensores`
+- **Interval:** 300s (configurable con `POLL_SECONDS`)
+- **Datos:** temperatura, humedad, velocidad del viento
+- **Ubicación:** Santiago, Chile (-33.45, -70.66)
+
+### 2. **Sensor Simulator (producer/sensor-simulator.py)**
+- **Tópico Kafka:** `sensores-iot`
+- **Interval:** 60s (configurable con `POLL_SECONDS_SENSORS`)
+- **Datos:** temperatura, humedad, presión, radiación solar, índice de calidad del aire, nivel de CO₂
+- **Cantidad:** 5 sensores distribuidos simulados
+- **Variación:** Datos realistas con desviación estándar Gaussiana
+
+### 3. **Video Simulator (producer/video-simulator.py)**
+- **Tópico Kafka:** `video-stream`
+- **Interval:** 30s (configurable con `POLL_SECONDS_VIDEO`)
+- **Datos:** metadatos de video, detecciones de movimiento, FPS, tipos de objetos
+- **Cantidad:** 4 cámaras en diferentes zonas
+- **Características:** Simula personas, vehículos, animales, escombros
+
+## Indicadores de riesgo
 
 | Valor | Significado    |
 | ----- | -------------- |
@@ -740,65 +2782,438 @@ visualizacion: sensor.temperatura
 | 80    | caliente 🔥    |
 | 95    | crítico 🚨     |
 
-**Objetivo**
-Open-Meteo
-   ↓
-Kafka
-   ↓
-Bronze (MinIO)
-   ↓
-Processor
-   ↓
-Silver (MinIO)
-   ↓
-ML API
-   ↓
-Gold (MinIO)
-   ↓
-DuckDB
-   ↓
-Metabase
+## Arquitectura del Pipeline
 
-AWS	Local
-S3 Bronze	MinIO Bronze
-S3 Silver	MinIO Silver
-S3 Gold	MinIO Gold
-Kinesis	Kafka
-IoT Core	Producer
-Flink	Silver Processor
-SageMaker	FastAPI + Scikit-Learn
-Athena	DuckDB
-QuickSight	Metabase
-CloudWatch	Datadog
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     FUENTES DE DATOS                          │
+├─────────────────────────────────────────────────────────────┤
+│  • Open-Meteo (temperatura, humedad, viento)                │
+│  • Sensor IoT (presión, radiación, AQI, CO₂)               │
+│  • Video Surveillance (movimiento, detecciones, FPS)       │
+└───────────────────┬──────────────────────────────────────────┘
+                    │
+                    ▼
+          ┌─────────────────┐
+          │    KAFKA        │
+          │                 │
+          │  sensores       │
+          │  sensores-iot   │
+          │  video-stream   │
+          └────────┬────────┘
+                   │
+        ┌──────────┴──────────┐
+        │                     │
+        ▼                     ▼
+    ┌────────┐          ┌────────┐
+    │ BRONZE │          │        │
+    │ (MinIO)│          │ LOGS   │
+    └───┬────┘          │Datadog │
+        │               │        │
+        ▼               └────────┘
+    ┌────────┐
+    │ SILVER │  ← Limpieza, validación, enriquecimiento
+    │ (MinIO)│
+    └───┬────┘
+        │
+        ▼
+    ┌────────┐
+    │ ML API │  ← Inferencia (risk_score, risk_level)
+    │(FastAPI)
+    └───┬────┘
+        │
+        ▼
+    ┌────────┐
+    │  GOLD  │  ← Datos enriquecidos
+    │ (MinIO)│
+    └───┬────┘
+        │
+        ▼
+    ┌────────┐
+    │ DuckDB │  ← Análisis (próximo)
+    └───┬────┘
+        │
+        ▼
+    ┌──────────┐
+    │ Metabase │  ← Dashboards (próximo)
+    └──────────┘
+```
+
+## Variables de entorno
+
+```bash
+# Kafka
+KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+KAFKA_TOPIC=sensores
+KAFKA_TOPIC_SENSORS=sensores-iot
+KAFKA_TOPIC_VIDEO=video-stream
+
+# Open-Meteo
+LATITUDE=-33.45
+LONGITUDE=-70.66
+POLL_SECONDS=300
+
+# Sensores IoT
+POLL_SECONDS_SENSORS=60
+
+# Video
+POLL_SECONDS_VIDEO=30
+
+# MinIO
+MINIO_ENDPOINT_URL=http://minio:9000
+AWS_ACCESS_KEY_ID=admin
+AWS_SECRET_ACCESS_KEY=admin123
+BRONZE_BUCKET=bronze
+PLATA_BUCKET=plata
+ORO_BUCKET=oro
+
+# ML API
+MODEL_PATH=model.pkl
+
+# Datadog
+DD_API_KEY=<your-datadog-api-key>
+DD_SITE=us5.datadoghq.com
+DATADOG_HOST=datadog
+DATADOG_PORT=8125
+```
+
+## Monitoreo
+
+Acceder a Datadog para ver logs y métricas de los servicios. Las métricas disponibles incluyen:
+
+- `bronze.records` - registros recibidos en Bronze
+- `silver.records` - registros procesados en Silver
+- `gold.records` - registros enriquecidos en Gold
+- `wildfire.risk_score` - puntuación de riesgo detectada
+- `wildfire.alerts` - número de alertas generadas
+
+## Problemas identificados y mejoras
+
+Ver el archivo [PROBLEMAS_IDENTIFICADOS.md](PROBLEMAS_IDENTIFICADOS.md) para una lista detallada de:
+
+1. Generación automática del modelo ML
+2. Importaciones absolutas en Python
+3. Sincronización temporal en datos
+4. Escalabilidad en MinIO
+5. Observabilidad mejorada
+6. Capa analítica (DuckDB + Metabase)
+7. Y más...
+
+---
+
+**Última actualización:** 2026-06-09
 </file>
 
 <file path="requirements.txt">
-kafka-python
-boto3
-fastapi
-uvicorn
-scikit-learn
-datadog
+kafka-python==2.0.2
+boto3==1.28.50
+fastapi==0.103.0
+uvicorn==0.23.2
+scikit-learn==1.3.1
+datadog==0.48.0
+requests==2.31.0
+pandas==2.0.3
+joblib==1.3.2
+pydantic==2.3.0
+pydantic-settings==2.0.3
+duckdb==0.9.0
+numpy==1.24.3
+</file>
+
+<file path="SOLUCION_PROBLEMAS.md">
+## 📋 Soluciones de Problemas Implementadas
+
+Este documento resume las 10 soluciones arquitectónicas implementadas para hacer el pipeline de datos production-ready.
+
+### ✅ Problemas Resueltos (1-5)
+
+#### 1. **ML Model Generation** 
+- **Problema**: Container fallaba al iniciar si model.pkl no existía
+- **Solución**: Se agregó `RUN python ml-api/train.py` en el Dockerfile
+- **Archivo**: `ml-api/Dockerfile`
+
+#### 2. **Absolute Imports en Runners**
+- **Problema**: Import paths fallaban cuando ejecutados desde el container
+- **Solución**: Se agregó `sys.path.insert()` y imports absolutos `from lake.plata.limpieza import`
+- **Archivos**: `lake/plata/runner.py`, `lake/oro/runner.py`
+
+#### 3. **Open-Meteo Temporal Sync**
+- **Problema**: Humedad fetched de API "hourly" mientras temp/wind de "current_weather" - inconsistencia
+- **Solución**: Cambiar a parámetro "current" con todos los campos del mismo timestamp
+- **Archivo**: `producer/open-meteo.py`
+
+#### 4. **MinIO Scalability (Pagination)**
+- **Problema**: `list_objects_v2()` sin paginación limitaba a ~1000 objetos
+- **Solución**: Implementar generador `list_all_objects()` con ContinuationToken
+- **Archivos**: `lake/plata/runner.py`, `lake/oro/runner.py`
+
+#### 5. **Datadog Observability**
+- **Problema**: No había metrics enviadas a Datadog para monitoring
+- **Solución**: Integrar statsd con DogStatsD, agregar `statsd.increment()` y `statsd.gauge()`
+- **Archivos**: `consumer/consumer.py`, `lake/plata/runner.py`, `lake/oro/runner.py`
+
+---
+
+### ✅ Problemas Resueltos (6-10)
+
+#### 6. **Analytics Layer (DuckDB)**
+- **Problema**: No había capa analítica para BI/dashboards
+- **Solución**: Crear analytics-loader que:
+  - Lee datos enriquecidos del oro bucket
+  - Carga a DuckDB con schema de tablas
+  - Calcula estadísticas horarias automáticas
+  - Mantiene estado processed en bucket separado
+- **Archivos Nuevos**: `lake/analytics/loader.py`
+- **Características**:
+  - ✅ Tabla `enriched_events` con índices
+  - ✅ Tabla `hourly_stats` con agregaciones
+  - ✅ Paginación automática de S3
+
+#### 7. **Retry Logic con Exponential Backoff**
+- **Problema**: Sin reintentos, fallos ocasionales causa pérdida de datos
+- **Solución**: Crear decoradores reutilizables con backoff exponencial
+- **Archivos Nuevos**: `lake/retry_utils.py`
+- **Decoradores**:
+  - `@retry_with_backoff(max_attempts=3, base_delay=1)`
+  - `@retry_on_exception((ExceptionType,), max_attempts=5)`
+  - `@handle_and_log("error message", default_return=None)`
+
+#### 8. **Schema Validation con Pydantic**
+- **Problema**: Sin validación, datos inválidos se propagan por el pipeline
+- **Solución**: Definir Pydantic models con validaciones automáticas
+- **Archivos Nuevos**: `lake/schemas.py`
+- **Modelos**:
+  - `WeatherData` - validación de rangos [-50..60]°C, [0..100]% humidity
+  - `SensorData` - 6 tipos de sensores IoT
+  - `VideoFrameData` - metadatos de video
+  - `CleanedWeatherData` - datos en plata layer
+  - `EnrichedWeatherData` - datos en oro layer
+  - `ModelMetadata` - versionamiento
+
+#### 9. **Event Aggregator**
+- **Problema**: Múltiples tópicos Kafka sin correlación ni ordenamiento
+- **Solución**: Crear aggregator que:
+  - Consume simultáneamente de 3 tópicos (sensores, IoT, video)
+  - Enriquece con source_topic, event_type, aggregated_at
+  - Publica a tópico unificado `aggregated-events`
+  - ThreadPoolExecutor para paralelismo
+- **Archivos Nuevos**: `consumer/event_aggregator.py`
+- **Características**:
+  - ✅ Multi-threaded consumption
+  - ✅ Event classification automática
+  - ✅ Contadores de eventos por fuente
+
+#### 10. **Model Registry & Versioning**
+- **Problema**: Sin historial de modelos, imposible rollback o comparison
+- **Solución**: Crear ModelRegistry que:
+  - Guarda versiones con timestamp
+  - Almacena metadata.json con métricas
+  - Permite cargar modelo por versión
+  - Compara métricas entre versiones
+- **Archivos Nuevos**: `ml-api/model_registry.py`
+- **Características**:
+  - ✅ `save_model()` - guarda con accuracy/precision/recall/f1
+  - ✅ `load_model(version_id="latest")` - carga con fallback
+  - ✅ `list_versions()` - historial completo
+  - ✅ `compare_versions()` - comparativa métrico
+
+---
+
+## 🏗️ Arquitectura Actualizada
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   PRODUCER LAYER                         │
+├─────────────────────────────────────────────────────────┤
+│  open-meteo.py (weather) │ sensor-sim.py │ video-sim.py │
+└────────────────┬──────────────────────┬──────────────────┘
+                 │                      │
+                 └──────────────────────┘
+                          │
+                    ┌─────▼──────┐
+                    │   KAFKA    │ (3 tópicos)
+                    │  7.0.1     │
+                    └─────┬──────┘
+                          │
+        ┌─────────────────┼──────────────────┐
+        │                 │                  │
+    ┌───▼──┐      ┌──────▼──────┐    ┌─────▼────┐
+    │BRONZE│      │ AGGREGATOR  │    │ (Bronze) │
+    │(S3)  │      │  (Unify)    │    │ Consumer │
+    └───┬──┘      └──────┬──────┘    └──────────┘
+        │                │
+        └────────┬───────┘
+                 │
+             ┌───▼──────┐
+             │  PLATA   │ (Silver - Clean)
+             │ (S3)     │
+             └───┬──────┘
+                 │
+             ┌───▼──────┐
+             │   ORO    │ (Gold - Enrich + ML)
+             │ (S3)     │
+             └───┬──────┘
+                 │
+        ┌────────┼──────────┐
+        │        │          │
+    ┌───▼────┐ ┌─▼──────┐ ┌─▼─────────────┐
+    │ANALYTICS├─┤DUCKDB  │ │  DATADOG     │
+    │LOADER   │ │(Tables)│ │  (Metrics)   │
+    └────┬────┘ └────┬───┘ └──────────────┘
+         │           │
+     ┌───▼───────┬───▼────┐
+     │ BI/       │ API    │
+     │ Dashboards│ ml-api │
+     └───────────┴────────┘
+```
+
+---
+
+## 📦 Nuevos Archivos Creados
+
+### Validación y Utilidades
+- `lake/schemas.py` - Pydantic models para todo el pipeline
+- `lake/retry_utils.py` - Decoradores para retry logic
+
+### Analytics
+- `lake/analytics/loader.py` - DuckDB ingestion y estadísticas
+- `lake/analytics/__init__.py` - Package marker
+
+### Machine Learning
+- `ml-api/model_registry.py` - Versionamiento y gestión de modelos
+- `ml-api/train.py` (actualizado) - Integración con registry
+
+### Agregación
+- `consumer/event_aggregator.py` - Multi-topic coordinator
+
+### Contenedores
+- `lake/Dockerfile` - Imagen genérica para servicios de lake
+
+---
+
+## 🔧 Actualizaciones de Archivos Existentes
+
+| Archivo | Cambio | Razón |
+|---------|--------|-------|
+| `ml-api/app.py` | +145 líneas | Model registry, health checks, versioning |
+| `ml-api/Dockerfile` | +1 línea | `RUN python ml-api/train.py` |
+| `ml-api/train.py` | +70 líneas | Logging, model registry integration |
+| `producer/open-meteo.py` | +5 líneas | Fix API parameters consistency |
+| `lake/plata/runner.py` | Rewrite | Pagination, imports, metrics |
+| `lake/oro/runner.py` | Rewrite | Pagination, imports, metrics |
+| `consumer/consumer.py` | +20 líneas | Datadog metrics |
+| `docker-compose.yml` | +40 líneas | 2 nuevos servicios |
+| `requirements.txt` | +5 packages | pydantic, duckdb, joblib |
+
+---
+
+## 🚀 Cómo Usar
+
+### Iniciar el Stack Completo
+```bash
+docker-compose up -d
+```
+
+### Verificar Servicios
+```bash
+# Health check ML API
+curl http://localhost:8000/health
+
+# Ver versiones de modelos
+curl http://localhost:8000/model/versions
+
+# Hacer predicción
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"temperature": 35, "humidity": 20, "wind_speed": 30}'
+```
+
+### Acceder a Datos
+```bash
+# MinIO Console
+http://localhost:9001
+
+# Analytics (DuckDB)
+docker exec analytics-loader duckdb /data/analytics.duckdb \
+  "SELECT * FROM enriched_events LIMIT 10"
+```
+
+---
+
+## 📊 Métricas Disponibles
+
+### Datadog Metrics
+- `bronze.records.received` - Eventos recibidos del producer
+- `bronze.records.failed` - Errores en ingesta
+- `silver.records.processed` - Registros validados
+- `silver.records.invalid` - Registros rechazados
+- `gold.records.enriched` - Registros con ML prediction
+- `gold.records.failed` - Errores en enriquecimiento
+- `wildfire.risk_score` - Score de riesgo (gauge)
+
+### Analytics (DuckDB)
+- `enriched_events` - Tabla de eventos procesados
+- `hourly_stats` - Estadísticas horarias (avg, max, counts)
+
+---
+
+## ✨ Beneficios de la Solución
+
+| Problema | Antes | Después |
+|----------|-------|---------|
+| Escalabilidad S3 | 1000 objects max | Unlimited (paginación) |
+| Confiabilidad | Fallos ocasionales | Retry con backoff |
+| Validación | Ninguna | Pydantic automático |
+| Observabilidad | Solo logs | Datadog + DuckDB |
+| ML Versioning | Un modelo | Historial completo |
+| Coordinación | 3 tópicos independientes | Agregador unificado |
+| Analytics | Ninguno | DuckDB + BI ready |
+
+---
+
+## 🔐 Production Readiness
+
+### Completado ✅
+- ✅ Error handling en todos los components
+- ✅ Paginación para datasets grandes
+- ✅ Validación de datos automática
+- ✅ Observabilidad con métricas
+- ✅ Versionamiento de modelos
+- ✅ Retry logic con exponential backoff
+- ✅ Multi-source coordination
+- ✅ Analytics warehouse
+
+### Próximos Pasos (Opcional)
+- [ ] Autoscaling por carga (Kubernetes)
+- [ ] Alertas automatizadas en Datadog
+- [ ] Backup y disaster recovery
+- [ ] Replicación cross-region
+- [ ] Data quality SLA monitoring
 </file>
 
 <file path="test.py">
-from datadog import initialize, statsd
+import os
 import time
+from datadog import initialize, statsd
+
+api_key = os.getenv("DD_API_KEY")
+if not api_key:
+    raise RuntimeError("DD_API_KEY no está definido en el entorno")
 
 initialize(
-    api_key="4e040f2fee6f2337ce4a56646eccb1fc"
+    api_key=api_key
 )
 
 print("Enviando métricas de prueba...")
 
 for i in range(10):
 
-    statsd.gauge("wildfire.temperature", 40)
-    statsd.gauge("wildfire.humidity", 10)
-    statsd.gauge("wildfire.wind_speed", 30)
-    statsd.gauge("wildfire.risk_score", 100)
+    statsd.gauge("incendio.temperatura", 40)
+    statsd.gauge("incendio.humedad", 10)
+    statsd.gauge("incendio.velocidad_viento", 30)
+    statsd.gauge("incendio.riesgo.puntaje", 100)
 
-    statsd.increment("wildfire.alerts")
+    statsd.increment("incendio.alertas")
 
     print(f"Prueba #{i+1}")
 

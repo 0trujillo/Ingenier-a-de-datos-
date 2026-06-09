@@ -1,20 +1,25 @@
-from datadog import initialize, statsd
+import os
 import time
+from datadog import initialize, statsd
+
+api_key = os.getenv("DD_API_KEY")
+if not api_key:
+    raise RuntimeError("DD_API_KEY no está definido en el entorno")
 
 initialize(
-    api_key="4e040f2fee6f2337ce4a56646eccb1fc"
+    api_key=api_key
 )
 
 print("Enviando métricas de prueba...")
 
 for i in range(10):
 
-    statsd.gauge("wildfire.temperature", 40)
-    statsd.gauge("wildfire.humidity", 10)
-    statsd.gauge("wildfire.wind_speed", 30)
-    statsd.gauge("wildfire.risk_score", 100)
+    statsd.gauge("incendio.temperatura", 40)
+    statsd.gauge("incendio.humedad", 10)
+    statsd.gauge("incendio.velocidad_viento", 30)
+    statsd.gauge("incendio.riesgo.puntaje", 100)
 
-    statsd.increment("wildfire.alerts")
+    statsd.increment("incendio.alertas")
 
     print(f"Prueba #{i+1}")
 

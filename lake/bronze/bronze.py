@@ -1,24 +1,43 @@
 import boto3
 import json
+import logging
+import os
 import time
+
+MINIO_ENDPOINT_URL = os.getenv("MINIO_ENDPOINT_URL", "http://minio:9000")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "admin")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "admin123")
+BRONZE_BUCKET = os.getenv("BRONZE_BUCKET", "bronze")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 s3 = boto3.client(
     "s3",
-    endpoint_url="http://minio:9000",
-    aws_access_key_id="admin",
-    aws_secret_access_key="admin123"
+    endpoint_url=MINIO_ENDPOINT_URL,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-try:
-    s3.head_bucket(Bucket="bronze")
-except:
-    s3.create_bucket(Bucket="bronze")
+def ensure_bucket(bucket_name):
+    try:
+        s3.head_bucket(Bucket=bucket_name)
+    except Exception as exc:
+        logging.warning("Bucket %s no existe, creando... %s", bucket_name, exc)
+        s3.create_bucket(Bucket=bucket_name)
+
+
+ensure_bucket(BRONZE_BUCKET)
 
 
 def upload(data):
-
-    s3.put_object(
-        Bucket="bronze",
-        Key=f"bronze_{int(time.time()*1000)}.json",
-        Body=json.dumps(data)
-    )
+    key = f"bronze_{int(time.time() * 1000)}.json"
+    try:
+        s3.put_object(
+            Bucket=BRONZE_BUCKET,
+            Key=key,
+            Body=json.dumps(data)
+        )
+        logging.info("✅ Bronze upload successful: %s", key)
+    except Exception as exc:
+        logging.error("❌ Error al subir objeto a Bronze: %s", exc, exc_info=True)
+        raise
