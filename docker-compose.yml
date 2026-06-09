@@ -70,3 +70,20 @@ services:
 
     ports:
       - "8000:8000"
+
+  silver:
+  build:
+    context: .
+    dockerfile: lake/plata/Dockerfile
+
+  depends_on:
+    - minio
+
+  gold:
+    build:
+      context: .
+      dockerfile: lake/oro/Dockerfile
+
+    depends_on:
+      - minio
+      - ml-api

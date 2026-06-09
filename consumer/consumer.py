@@ -13,7 +13,7 @@ sys.path.append(
     )
 )
 
-from lake.uploader import upload
+from lake.bronze.bronze import upload
 
 
 # ------------------------
@@ -63,96 +63,16 @@ for msg in consumer:
 
     data = msg.value
 
-    temperature = data["temperature"]
-    humidity = data["humidity"]
-    wind = data["wind_speed"]
-
-    logging.info(f"Dato recibido: {data}")
-
-    # ------------------------
-    # Risk Score
-    # ------------------------
-
-    risk = 0
-
-    if temperature > 35:
-        risk += 40
-
-    if humidity < 20:
-        risk += 30
-
-    if wind > 25:
-        risk += 30
-
-    logging.info(f"Risk Score: {risk}")
-
-    # ------------------------
-    # Datadog Metrics
-    # ------------------------
-
-    statsd.gauge(
-        "wildfire.temperature",
-        temperature
-    )
-
-    statsd.gauge(
-        "wildfire.humidity",
-        humidity
-    )
-
-    statsd.gauge(
-        "wildfire.wind_speed",
-        wind
-    )
-
-    statsd.gauge(
-        "wildfire.risk_score",
-        risk
-    )
-
-    # ------------------------
-    # Alerta
-    # ------------------------
-
-    if risk >= 70:
-
-        logging.warning(
-            f"""
-🔥 ALERTA DE INCENDIO
-
-Temperatura: {temperature}
-Humedad: {humidity}
-Viento: {wind}
-Risk Score: {risk}
-"""
-        )
-
-        statsd.increment(
-            "wildfire.alerts"
-        )
-
-    # ------------------------
-    # Data Lake (MinIO)
-    # ------------------------
-
-    record = {
-        "temperature": temperature,
-        "humidity": humidity,
-        "wind_speed": wind,
-        "risk": risk,
-        "timestamp": data["timestamp"]
-    }
-
     try:
 
-        upload(record)
+        upload(data)
 
         logging.info(
-            "✅ Registro enviado a MinIO"
+            "✅ Registro enviado a Bronze"
         )
 
     except Exception as e:
 
         logging.error(
-            f"❌ Error subiendo a MinIO: {e}"
+            f"❌ Error subiendo a Bronze: {e}"
         )

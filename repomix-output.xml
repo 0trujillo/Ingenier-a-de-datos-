@@ -43,10 +43,16 @@ The content is organized as follows:
 consumer/consumer.py
 consumer/Dockerfile
 docker-compose.yml
-lake/__init__.py
-lake/uploader.py
+lake/bronze/__init__.py
+lake/bronze/bronze.py
+lake/oro/Dockerfile
+lake/oro/processor.py
+lake/oro/runner.py
+lake/plata/Dockerfile
+lake/plata/limpieza.py
+lake/plata/runner.py
 ml-api/app.py
-ml-api/Dockerfile
+ml-api/train.py
 package.json
 producer/Dockerfile
 producer/open-meteo.py
@@ -57,94 +63,6 @@ test.py
 
 <files>
 This section contains the contents of the repository's files.
-
-<file path="consumer/Dockerfile">
-FROM python:3.11
-
-WORKDIR /app
-
-COPY . .
-
-RUN pip install -r requirements.txt
-
-CMD ["python", "consumer/consumer.py"]
-</file>
-
-<file path="lake/__init__.py">
-
-</file>
-
-<file path="package.json">
-{
-	"dependencies": {
-		"repomix": "^1.14.1"
-	}
-}
-</file>
-
-<file path="producer/Dockerfile">
-FROM python:3.11
-
-WORKDIR /app
-
-COPY . .
-
-RUN pip install -r requirements.txt
-
-CMD ["python", "producer/open-meteo.py"]
-</file>
-
-<file path="producer/open-meteo.py">
-import json
-import time
-import requests
-
-from kafka import KafkaProducer
-
-
-while True:
-    try:
-        producer = KafkaProducer(
-            bootstrap_servers="kafka:9092",
-            value_serializer=lambda v: json.dumps(v).encode("utf-8")
-        )
-
-        print("✅ Kafka listo")
-        break
-
-    except Exception as e:
-        print("Esperando Kafka...", e)
-        time.sleep(5)
-
-LAT = -33.45
-LON = -70.66
-
-while True:
-
-    response = requests.get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude": LAT,
-            "longitude": LON,
-            "current": "temperature_2m,relative_humidity_2m,wind_speed_10m"
-        }
-    )
-
-    current = response.json()["current"]
-
-    data = {
-        "temperature": current["temperature_2m"],
-        "humidity": current["relative_humidity_2m"],
-        "wind_speed": current["wind_speed_10m"],
-        "timestamp": time.time()
-    }
-
-    producer.send("sensores", data)
-
-    print("Enviado:", data)
-
-    time.sleep(300)
-</file>
 
 <file path="consumer/consumer.py">
 from kafka import KafkaConsumer
@@ -162,7 +80,7 @@ sys.path.append(
     )
 )
 
-from lake.uploader import upload
+from lake.bronze.bronze import upload
 
 
 # ------------------------
@@ -212,99 +130,31 @@ for msg in consumer:
 
     data = msg.value
 
-    temperature = data["temperature"]
-    humidity = data["humidity"]
-    wind = data["wind_speed"]
-
-    logging.info(f"Dato recibido: {data}")
-
-    # ------------------------
-    # Risk Score
-    # ------------------------
-
-    risk = 0
-
-    if temperature > 35:
-        risk += 40
-
-    if humidity < 20:
-        risk += 30
-
-    if wind > 25:
-        risk += 30
-
-    logging.info(f"Risk Score: {risk}")
-
-    # ------------------------
-    # Datadog Metrics
-    # ------------------------
-
-    statsd.gauge(
-        "wildfire.temperature",
-        temperature
-    )
-
-    statsd.gauge(
-        "wildfire.humidity",
-        humidity
-    )
-
-    statsd.gauge(
-        "wildfire.wind_speed",
-        wind
-    )
-
-    statsd.gauge(
-        "wildfire.risk_score",
-        risk
-    )
-
-    # ------------------------
-    # Alerta
-    # ------------------------
-
-    if risk >= 70:
-
-        logging.warning(
-            f"""
-🔥 ALERTA DE INCENDIO
-
-Temperatura: {temperature}
-Humedad: {humidity}
-Viento: {wind}
-Risk Score: {risk}
-"""
-        )
-
-        statsd.increment(
-            "wildfire.alerts"
-        )
-
-    # ------------------------
-    # Data Lake (MinIO)
-    # ------------------------
-
-    record = {
-        "temperature": temperature,
-        "humidity": humidity,
-        "wind_speed": wind,
-        "risk": risk,
-        "timestamp": data["timestamp"]
-    }
-
     try:
 
-        upload(record)
+        upload(data)
 
         logging.info(
-            "✅ Registro enviado a MinIO"
+            "✅ Registro enviado a Bronze"
         )
 
     except Exception as e:
 
         logging.error(
-            f"❌ Error subiendo a MinIO: {e}"
+            f"❌ Error subiendo a Bronze: {e}"
         )
+</file>
+
+<file path="consumer/Dockerfile">
+FROM python:3.11
+
+WORKDIR /app
+
+COPY . .
+
+RUN pip install -r requirements.txt
+
+CMD ["python", "consumer/consumer.py"]
 </file>
 
 <file path="docker-compose.yml">
@@ -380,9 +230,30 @@ services:
 
     ports:
       - "8000:8000"
+
+  silver:
+  build:
+    context: .
+    dockerfile: lake/plata/Dockerfile
+
+  depends_on:
+    - minio
+
+  gold:
+    build:
+      context: .
+      dockerfile: lake/oro/Dockerfile
+
+    depends_on:
+      - minio
+      - ml-api
 </file>
 
-<file path="lake/uploader.py">
+<file path="lake/bronze/__init__.py">
+
+</file>
+
+<file path="lake/bronze/bronze.py">
 import boto3
 import json
 import time
@@ -399,42 +270,506 @@ try:
 except:
     s3.create_bucket(Bucket="bronze")
 
+
 def upload(data):
+
     s3.put_object(
         Bucket="bronze",
-        Key=f"data_{int(time.time())}.json",
+        Key=f"bronze_{int(time.time()*1000)}.json",
         Body=json.dumps(data)
     )
 </file>
 
-<file path="ml-api/app.py">
-from fastapi import FastAPI
-
-app = FastAPI()
-
-@app.get("/")
-def home():
-    return {"status": "ok"}
-
-@app.post("/predict")
-def predict(data: dict):
-    temp = data["temp"]
-
-    if temp > 75:
-        return {"risk": "alto"}
-    return {"risk": "normal"}
-</file>
-
-<file path="ml-api/Dockerfile">
-FROM python:3.10
+<file path="lake/oro/Dockerfile">
+FROM python:3.11
 
 WORKDIR /app
 
 COPY . .
 
-RUN pip install fastapi uvicorn
+RUN pip install -r requirements.txt
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "lake/oro/runner.py"]
+</file>
+
+<file path="lake/oro/processor.py">
+import json
+import time
+import requests
+import boto3
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://minio:9000",
+    aws_access_key_id="admin",
+    aws_secret_access_key="admin123"
+)
+
+try:
+    s3.head_bucket(Bucket="oro")
+except:
+    s3.create_bucket(Bucket="oro")
+
+
+def enrich(record):
+
+    response = requests.post(
+        "http://ml-api:8000/predict",
+        json={
+            "temp": record["temperature"],
+            "humidity": record["humidity"],
+            "wind": record["wind_speed"]
+        }
+    )
+
+    prediction = response.json()
+
+    final_record = {
+        **record,
+        "risk_score": prediction["risk_score"],
+        "risk_level": prediction["risk_level"]
+    }
+
+    s3.put_object(
+        Bucket="oro",
+        Key=f"gold_{int(time.time()*1000)}.json",
+        Body=json.dumps(final_record)
+    )
+
+    return final_record
+</file>
+
+<file path="lake/oro/runner.py">
+import json
+import boto3
+
+from processor import enrich
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://minio:9000",
+    aws_access_key_id="admin",
+    aws_secret_access_key="admin123"
+)
+
+processed = set()
+
+print("Gold Runner iniciado")
+
+while True:
+
+    response = s3.list_objects_v2(
+        Bucket="plata"
+    )
+
+    if "Contents" not in response:
+        continue
+
+    for obj in response["Contents"]:
+
+        key = obj["Key"]
+
+        if key in processed:
+            continue
+
+        file = s3.get_object(
+            Bucket="plata",
+            Key=key
+        )
+
+        data = json.loads(
+            file["Body"].read()
+        )
+
+        enrich(data)
+
+        print(
+            f"Enriquecido -> {key}"
+        )
+
+        processed.add(key)
+</file>
+
+<file path="lake/plata/Dockerfile">
+FROM python:3.11
+
+WORKDIR /app
+
+COPY . .
+
+RUN pip install -r requirements.txt
+
+CMD ["python", "lake/plata/runner.py"]
+</file>
+
+<file path="lake/plata/limpieza.py">
+import json
+import time
+import boto3
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://minio:9000",
+    aws_access_key_id="admin",
+    aws_secret_access_key="admin123"
+)
+
+# Crear bucket plata
+try:
+    s3.head_bucket(Bucket="plata")
+except:
+    s3.create_bucket(Bucket="plata")
+
+
+def process_record(data):
+
+    temp = data["temperature"]
+    humidity = data["humidity"]
+    wind = data["wind_speed"]
+
+    # Validaciones básicas
+    if temp < -50 or temp > 60:
+        return None
+
+    if humidity < 0 or humidity > 100:
+        return None
+
+    if wind < 0:
+        return None
+
+    # Transformación
+    heat_index = temp + (wind * 0.2)
+
+    return {
+        "temperature": temp,
+        "humidity": humidity,
+        "wind_speed": wind,
+        "heat_index": round(heat_index, 2),
+        "timestamp": data["timestamp"],
+        "processed_at": time.time()
+    }
+
+
+def upload_to_silver(record):
+
+    s3.put_object(
+        Bucket="plata",
+        Key=f"silver_{int(time.time()*1000)}.json",
+        Body=json.dumps(record)
+    )
+</file>
+
+<file path="lake/plata/runner.py">
+import json
+import boto3
+
+from limpieza import (
+    process_record,
+    upload_to_silver
+)
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://minio:9000",
+    aws_access_key_id="admin",
+    aws_secret_access_key="admin123"
+)
+
+processed = set()
+
+print("Silver Runner iniciado")
+
+while True:
+
+    response = s3.list_objects_v2(
+        Bucket="bronze"
+    )
+
+    if "Contents" not in response:
+        continue
+
+    for obj in response["Contents"]:
+
+        key = obj["Key"]
+
+        if key in processed:
+            continue
+
+        file = s3.get_object(
+            Bucket="bronze",
+            Key=key
+        )
+
+        data = json.loads(
+            file["Body"].read()
+        )
+
+        clean_data = process_record(
+            data
+        )
+
+        if clean_data:
+
+            upload_to_silver(
+                clean_data
+            )
+
+            print(
+                f"Procesado -> {key}"
+            )
+
+        processed.add(key)
+</file>
+
+<file path="ml-api/app.py">
+from fastapi import FastAPI
+import joblib
+
+app = FastAPI()
+
+model = joblib.load("model.pkl")
+
+
+@app.get("/")
+def home():
+    return {
+        "status": "ok"
+    }
+
+
+@app.post("/predict")
+def predict(data: dict):
+
+    temp = data["temp"]
+    humidity = data["humidity"]
+    wind = data["wind"]
+
+    prediction = model.predict([
+        [
+            temp,
+            humidity,
+            wind
+        ]
+    ])
+
+    probability = model.predict_proba([
+        [
+            temp,
+            humidity,
+            wind
+        ]
+    ])
+
+    risk_score = round(
+        probability[0][1] * 100,
+        2
+    )
+
+    return {
+        "risk_score": risk_score,
+        "risk_level":
+            "ALTO"
+            if prediction[0] == 1
+            else "NORMAL"
+    }
+</file>
+
+<file path="ml-api/train.py">
+import pandas as pd
+import joblib
+
+from sklearn.ensemble import RandomForestClassifier
+
+data = []
+
+for temp in range(0, 50):
+    for humidity in range(5, 100, 5):
+        for wind in range(0, 40, 5):
+
+            risk = 0
+
+            if temp > 35:
+                risk += 40
+
+            if humidity < 20:
+                risk += 30
+
+            if wind > 25:
+                risk += 30
+
+            label = 1 if risk >= 70 else 0
+
+            data.append([
+                temp,
+                humidity,
+                wind,
+                label
+            ])
+
+df = pd.DataFrame(
+    data,
+    columns=[
+        "temperature",
+        "humidity",
+        "wind_speed",
+        "risk"
+    ]
+)
+
+X = df[
+    [
+        "temperature",
+        "humidity",
+        "wind_speed"
+    ]
+]
+
+y = df["risk"]
+
+model = RandomForestClassifier(
+    n_estimators=100,
+    random_state=42
+)
+
+model.fit(X, y)
+
+joblib.dump(
+    model,
+    "model.pkl"
+)
+
+print("Modelo entrenado")
+</file>
+
+<file path="package.json">
+{
+	"dependencies": {
+		"repomix": "^1.14.1"
+	}
+}
+</file>
+
+<file path="producer/Dockerfile">
+FROM python:3.11
+
+WORKDIR /app
+
+COPY . .
+
+RUN pip install -r requirements.txt
+
+CMD ["python", "producer/open-meteo.py"]
+</file>
+
+<file path="producer/open-meteo.py">
+import json
+import time
+import requests
+
+from kafka import KafkaProducer
+
+
+while True:
+    try:
+        producer = KafkaProducer(
+            bootstrap_servers="kafka:9092",
+            value_serializer=lambda v: json.dumps(v).encode("utf-8")
+        )
+
+        print("✅ Kafka listo")
+        break
+
+    except Exception as e:
+        print("Esperando Kafka...", e)
+        time.sleep(5)
+
+LAT = -33.45
+LON = -70.66
+
+while True:
+
+    response = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": LAT,
+            "longitude": LON,
+            "current": "temperature_2m,relative_humidity_2m,wind_speed_10m"
+        }
+    )
+
+    current = response.json()["current"]
+
+    data = {
+        "temperature": current["temperature_2m"],
+        "humidity": current["relative_humidity_2m"],
+        "wind_speed": current["wind_speed_10m"],
+        "timestamp": time.time()
+    }
+
+    producer.send("sensores", data)
+
+    print("Enviado:", data)
+
+    time.sleep(300)
+</file>
+
+<file path="README.md">
+# Ingenieria-de-datos-
+| AWS                   | Local (Docker)           |
+| --------------------- | ------------------------ |
+| S3 (Bronze/Plata/Oro) | MinIO                    |
+| Kinesis               | Kafka                    |
+| IoT Core              | Producer Python          |
+| Flink                 | Spark Streaming o Python |
+| SageMaker             | Scikit-learn + FastAPI   |
+| Athena                | Trino / DuckDB           |
+| QuickSight            | Metabase / Superset      |
+| EventBridge           | Kafka / Python events    |
+| SNS                   | Datadog Alerts           |
+| CloudWatch            | Datadog                  |
+
+instalar dependencias: pip install -r requirements.txt
+Levantar docker: docker-compose up -d
+docker logs ingenier-a-de-datos--datadog-1
+visualizacion: sensor.temperatura
+
+| Valor | Significado    |
+| ----- | -------------- |
+| 25    | normal ✅       |
+| 50    | carga media ⚠️ |
+| 80    | caliente 🔥    |
+| 95    | crítico 🚨     |
+
+**Objetivo**
+Open-Meteo
+   ↓
+Kafka
+   ↓
+Bronze (MinIO)
+   ↓
+Processor
+   ↓
+Silver (MinIO)
+   ↓
+ML API
+   ↓
+Gold (MinIO)
+   ↓
+DuckDB
+   ↓
+Metabase
+
+AWS	Local
+S3 Bronze	MinIO Bronze
+S3 Silver	MinIO Silver
+S3 Gold	MinIO Gold
+Kinesis	Kafka
+IoT Core	Producer
+Flink	Silver Processor
+SageMaker	FastAPI + Scikit-Learn
+Athena	DuckDB
+QuickSight	Metabase
+CloudWatch	Datadog
 </file>
 
 <file path="requirements.txt">
@@ -470,48 +805,6 @@ for i in range(10):
     time.sleep(2)
 
 print("Finalizado")
-</file>
-
-<file path="README.md">
-# Ingenieria-de-datos-
-| AWS                   | Local (Docker)           |
-| --------------------- | ------------------------ |
-| S3 (Bronze/Plata/Oro) | MinIO                    |
-| Kinesis               | Kafka                    |
-| IoT Core              | Producer Python          |
-| Flink                 | Spark Streaming o Python |
-| SageMaker             | Scikit-learn + FastAPI   |
-| Athena                | Trino / DuckDB           |
-| QuickSight            | Metabase / Superset      |
-| EventBridge           | Kafka / Python events    |
-| SNS                   | Datadog Alerts           |
-| CloudWatch            | Datadog                  |
-
-instalar dependencias: pip install -r requirements.txt
-Levantar docker: docker-compose up -d
-docker logs ingenier-a-de-datos--datadog-1
-visualizacion: sensor.temperatura
-
-| Valor | Significado    |
-| ----- | -------------- |
-| 25    | normal ✅       |
-| 50    | carga media ⚠️ |
-| 80    | caliente 🔥    |
-| 95    | crítico 🚨     |
-
-Open-Meteo API
-      ↓
-AWS Lambda
-      ↓
-Amazon S3
-      ↓
-AWS Glue Catalog
-      ↓
-Amazon Athena
-      ↓
-Data Warehouse
-      ↓
-Dashboard React
 </file>
 
 </files>

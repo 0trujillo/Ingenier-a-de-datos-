@@ -24,16 +24,33 @@ visualizacion: sensor.temperatura
 | 80    | caliente 🔥    |
 | 95    | crítico 🚨     |
 
-Open-Meteo API
-      ↓
-AWS Lambda
-      ↓
-Amazon S3
-      ↓
-AWS Glue Catalog
-      ↓
-Amazon Athena
-      ↓
-Data Warehouse
-      ↓
-Dashboard React
+**Objetivo**
+Open-Meteo
+   ↓
+Kafka
+   ↓
+Bronze (MinIO)
+   ↓
+Processor
+   ↓
+Silver (MinIO)
+   ↓
+ML API
+   ↓
+Gold (MinIO)
+   ↓
+DuckDB
+   ↓
+Metabase
+
+AWS	Local
+S3 Bronze	MinIO Bronze
+S3 Silver	MinIO Silver
+S3 Gold	MinIO Gold
+Kinesis	Kafka
+IoT Core	Producer
+Flink	Silver Processor
+SageMaker	FastAPI + Scikit-Learn
+Athena	DuckDB
+QuickSight	Metabase
+CloudWatch	Datadog

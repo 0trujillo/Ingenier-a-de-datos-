@@ -14,9 +14,11 @@ try:
 except:
     s3.create_bucket(Bucket="bronze")
 
+
 def upload(data):
+
     s3.put_object(
         Bucket="bronze",
-        Key=f"data_{int(time.time())}.json",
+        Key=f"bronze_{int(time.time()*1000)}.json",
         Body=json.dumps(data)
     )
