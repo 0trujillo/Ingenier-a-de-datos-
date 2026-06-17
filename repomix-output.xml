@@ -2879,13 +2879,43 @@ DATADOG_PORT=8125
 
 ## Monitoreo
 
-Acceder a Datadog para ver logs y métricas de los servicios. Las métricas disponibles incluyen:
+Para fortalecer la observabilidad del pipeline se implementó el uso de métricas en Datadog mediante DogStatsD, permitiendo monitorear el comportamiento de cada etapa del flujo de datos en tiempo real. Entre las métricas definidas se encuentran **Temperatura**, **Humedad**, **Velocidad del Viento** y **Puntaje de Riesgo**, las cuales reflejan las condiciones meteorológicas procesadas y el resultado de la inferencia realizada por el modelo de Machine Learning. Adicionalmente, se incorporó la métrica **Cantidad de Alertas**, utilizada para contabilizar eventos de riesgo detectados por el sistema.
 
-- `bronze.records` - registros recibidos en Bronze
-- `silver.records` - registros procesados en Silver
-- `gold.records` - registros enriquecidos en Gold
-- `wildfire.risk_score` - puntuación de riesgo detectada
-- `wildfire.alerts` - número de alertas generadas
+### Métricas disponibles en Datadog
+
+- `clima.temperatura` - temperatura actual recibida del productor meteorológico
+- `clima.humedad` - humedad relativa actual
+- `clima.velocidad_viento` - velocidad del viento
+
+- `sensor.temperatura` - temperatura reportada por los sensores IoT
+- `sensor.humedad` - humedad registrada por los sensores IoT
+- `sensor.indice_calidad_aire` - índice de calidad del aire capturado por los sensores
+
+- `video.fps` - cuadros por segundo procesados por la fuente de video
+- `video.detecciones` - cantidad de objetos o eventos detectados
+- `video.confianza_deteccion` - nivel de confianza promedio de las detecciones
+- `video.movimiento.detectado` - conteo de eventos de movimiento detectados
+
+- `incendio.riesgo.puntaje` - score de riesgo inferido por el modelo
+
+- `produccion.clima.enviados` - eventos meteorológicos enviados a Kafka
+- `produccion.sensores.enviados` - eventos IoT enviados a Kafka
+- `produccion.video.enviados` - eventos de video enviados a Kafka
+
+- `bronze.registros.recibidos` - registros recibidos y almacenados en la capa Bronze
+- `bronze.registros.fallidos` - errores durante la ingesta en la capa Bronze
+
+- `plata.registros.procesados` - registros procesados y validados en la capa Silver
+- `plata.registros.invalidos` - registros rechazados por errores de validación en Silver
+
+- `oro.registros.enriquecidos` - registros enriquecidos con datos agregados y análisis
+- `oro.registros.fallidos` - errores ocurridos durante el procesamiento en Gold
+
+- `agregador.eventos.clima` - eventos climáticos procesados por el agregador
+- `agregador.eventos.sensores` - eventos de sensores procesados por el agregador
+- `agregador.eventos.video` - eventos de video procesados por el agregador
+
+Como mejora futura, se recomienda añadir métricas operacionales adicionales como **errores.pipeline** y mayores métricas de salud general para obtener una visión integral del rendimiento, la calidad del procesamiento y la salud del pipeline de datos.
 
 ## Problemas identificados y mejoras
 
@@ -3142,14 +3172,26 @@ docker exec analytics-loader duckdb /data/analytics.duckdb \
 
 ## 📊 Métricas Disponibles
 
-### Datadog Metrics
-- `bronze.records.received` - Eventos recibidos del producer
-- `bronze.records.failed` - Errores en ingesta
-- `silver.records.processed` - Registros validados
-- `silver.records.invalid` - Registros rechazados
-- `gold.records.enriched` - Registros con ML prediction
-- `gold.records.failed` - Errores en enriquecimiento
-- `wildfire.risk_score` - Score de riesgo (gauge)
+Para fortalecer la observabilidad del pipeline se implementó el uso de métricas en Datadog mediante DogStatsD, permitiendo monitorear el comportamiento de cada etapa del flujo de datos en tiempo real. Entre las métricas definidas se encuentran **Temperatura**, **Humedad**, **Velocidad del Viento** y **Puntaje de Riesgo**, las cuales reflejan las condiciones meteorológicas procesadas y el resultado de la inferencia realizada por el modelo de Machine Learning. Adicionalmente, se incorporó la métrica **Cantidad de Alertas**, utilizada para contabilizar eventos de riesgo detectados por el sistema.
+
+### Métricas de Datadog implementadas
+- `clima.temperatura` - temperatura actual recibida del productor meteorológico
+- `clima.humedad` - humedad relativa actual
+- `clima.velocidad_viento` - velocidad del viento
+- `incendio.riesgo.puntaje` - score de riesgo inferido por el modelo
+- `incendio.alertas` - conteo de alertas de riesgo generadas
+- `produccion.clima.enviados` - eventos meteorológicos enviados a Kafka
+- `produccion.sensores.enviados` - eventos IoT enviados a Kafka
+- `produccion.video.enviados` - eventos de video enviados a Kafka
+- `bronze.registros.recibidos` - registros ingresados al bucket Bronze
+- `bronze.registros.fallidos` - errores al subir al bucket Bronze
+- `plata.registros.procesados` - registros procesados y validados en Silver
+- `plata.registros.invalidos` - registros rechazados en Silver
+- `oro.registros.enriquecidos` - registros enriquecidos con la predicción ML
+- `oro.registros.fallidos` - errores durante el enriquecimiento Gold
+- `agregador.eventos.clima` - eventos de clima agregados
+- `agregador.eventos.sensores` - eventos de sensores agregados
+- `agregador.eventos.video` - eventos de video agregados
 
 ### Analytics (DuckDB)
 - `enriched_events` - Tabla de eventos procesados
