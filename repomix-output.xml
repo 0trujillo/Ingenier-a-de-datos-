@@ -73,6 +73,8 @@ README.md
 requirements.txt
 SOLUCION_PROBLEMAS.md
 test.py
+tools/check_levels.py
+tools/push_test_silver.py
 </directory_structure>
 
 <files>
@@ -1837,7 +1839,7 @@ class EnrichedWeatherData(BaseModel):
     timestamp: float
     processed_at: float
     risk_score: float = Field(..., ge=0, le=100, description="Score de riesgo predicho")
-    risk_level: str = Field(..., pattern="^(NORMAL|ALTO)$")
+    risk_level: str = Field(..., pattern="^(NORMAL|MEDIO|ALTO)$")
     enriched_at: float = Field(default_factory=lambda: datetime.now().timestamp())
 
 
@@ -1890,7 +1892,7 @@ class PredictionRequest(BaseModel):
 class PredictionResponse(BaseModel):
     """Esquema de respuesta de predicción."""
     risk_score: float = Field(..., ge=0, le=100)
-    risk_level: str = Field(..., pattern="^(NORMAL|ALTO)$")
+    risk_level: str = Field(..., pattern="^(NORMAL|MEDIO|ALTO)$")
     model_version: str
     confidence: float = Field(..., ge=0, le=1)
 
@@ -2004,8 +2006,14 @@ async def predict(request: PredictionRequest) -> PredictionResponse:
         risk_probability = probabilities[1]  # Probabilidad de clase "ALTO"
         risk_score = risk_probability * 100
         
-        # Determinar nivel de riesgo
-        risk_level = "ALTO" if prediction == 1 else "NORMAL"
+        # Determinar nivel de riesgo a partir del score (3 niveles)
+        # score: 0-100
+        if risk_score >= 75:
+            risk_level = "ALTO"
+        elif risk_score >= 50:
+            risk_level = "MEDIO"
+        else:
+            risk_level = "NORMAL"
         
         logger.info(
             "🔮 Predicción: temp=%.1f, humidity=%.1f, wind=%.1f -> "
@@ -3263,6 +3271,8 @@ Ver el archivo [PROBLEMAS_IDENTIFICADOS.md](PROBLEMAS_IDENTIFICADOS.md) para una
 ---
 
 **Última actualización:** 2026-06-09
+
+test DD_API_KEY="tu_api_key" python test.py
 </file>
 
 <file path="requirements.txt">
@@ -3588,7 +3598,12 @@ for i in range(10):
     humidity = 15 + i * 3
     wind_speed = 5 + i * 1.5
     risk_score = round(min(100, max(0, 30 + i * 7)), 2)
-    risk_level = "ALTO" if risk_score >= 75 else "NORMAL"
+    if risk_score >= 75:
+        risk_level = "ALTO"
+    elif risk_score >= 50:
+        risk_level = "MEDIO"
+    else:
+        risk_level = "NORMAL"
     event_id = f"test-{i+1}"
 
     statsd.gauge("incendio.temperatura", temperature, tags=[f"event_id:{event_id}"])
@@ -3610,6 +3625,43 @@ for i in range(10):
     time.sleep(2)
 
 print("Finalizado")
+</file>
+
+<file path="tools/check_levels.py">
+scores = [0, 25, 50, 62, 74.9, 75, 90, 100]
+for score in scores:
+    if score >= 75:
+        level = "ALTO"
+    elif score >= 50:
+        level = "MEDIO"
+    else:
+        level = "NORMAL"
+    print(f"score={score:6} -> {level}")
+</file>
+
+<file path="tools/push_test_silver.py">
+import boto3, json, time, os
+
+MINIO_ENDPOINT_URL = os.getenv('MINIO_ENDPOINT_URL', 'http://minio:9000')
+AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID', 'admin')
+AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY', 'admin123')
+PLATA_BUCKET = os.getenv('PLATA_BUCKET', 'plata')
+
+s3 = boto3.client('s3', endpoint_url=MINIO_ENDPOINT_URL, aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY)
+
+record = {
+    "event_id": f"test-{int(time.time())}",
+    "source": "manual-test",
+    "temperature": 50.0,
+    "humidity": 10.0,
+    "wind_speed": 30.0,
+    "timestamp": time.time()
+}
+
+key = f"manual_test_{int(time.time()*1000)}.json"
+print('Uploading to', PLATA_BUCKET, 'key=', key)
+s3.put_object(Bucket=PLATA_BUCKET, Key=key, Body=json.dumps(record))
+print('Uploaded')
 </file>
 
 </files>
