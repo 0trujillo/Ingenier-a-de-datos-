@@ -3,6 +3,7 @@ import time
 import os
 import logging
 import requests
+import uuid
 
 from datadog import initialize, statsd
 from kafka import KafkaProducer
@@ -66,11 +67,16 @@ while True:
 
         current = payload.get("current", {})
 
+        event_id = uuid.uuid4().hex
+
         data = {
+            "event_id": event_id,
             "temperature": current.get("temperature_2m"),
             "humidity": current.get("relative_humidity_2m"),
             "wind_speed": current.get("wind_speed_10m"),
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "source_topic": KAFKA_TOPIC,
+            "source": "open-meteo"
         }
 
         if data["temperature"] is None or data["wind_speed"] is None or data["humidity"] is None:
@@ -81,7 +87,7 @@ while True:
         statsd.gauge("clima.temperatura", data["temperature"])
         statsd.gauge("clima.humedad", data["humidity"])
         statsd.gauge("clima.velocidad_viento", data["wind_speed"])
-        logging.info("Enviado: %s", data)
+        logging.info("Enviado: event_id=%s %s", event_id, data)
     except Exception as exc:
         logging.error("Error obteniendo datos meteorológicos: %s", exc, exc_info=True)
 

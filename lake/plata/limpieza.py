@@ -48,7 +48,13 @@ def process_record(data):
         return None
 
     heat_index = temp + (wind * 0.2)
+    # Mantener trazabilidad
+    event_id = data.get("event_id") or data.get("id")
+    source_topic = data.get("source_topic") or data.get("kafka_topic") or data.get("source")
+
     return {
+        "event_id": event_id,
+        "source_topic": source_topic,
         "temperature": temp,
         "humidity": humidity,
         "wind_speed": wind,

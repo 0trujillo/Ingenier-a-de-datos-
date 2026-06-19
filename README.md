@@ -211,3 +211,5 @@ Ver el archivo [PROBLEMAS_IDENTIFICADOS.md](PROBLEMAS_IDENTIFICADOS.md) para una
 ---
 
 **Última actualización:** 2026-06-09
+
+test DD_API_KEY="tu_api_key" python test.py

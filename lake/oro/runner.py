@@ -20,8 +20,10 @@ PROCESSED_BUCKET = os.getenv("PROCESSED_BUCKET", "oro-processed")
 DATADOG_HOST = os.getenv("DATADOG_HOST", "datadog")
 DATADOG_PORT = int(os.getenv("DATADOG_PORT", "8125"))
 
+logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+logger.info(f"Inicializando DogStatsD: {DATADOG_HOST}:{DATADOG_PORT}")
 initialize(
     statsd_host=DATADOG_HOST,
     statsd_port=DATADOG_PORT
@@ -108,14 +110,35 @@ while True:
                 continue
 
             try:
-                enrich(data)
-                logging.info("Enriquecido -> %s", key)
+                data = enrich(data)
+                logger.info("✅ Enriquecido -> %s", key)
                 statsd.increment("oro.registros.enriquecidos")
-                if data.get("risk_score"):
-                    statsd.gauge("incendio.riesgo.puntaje", data["risk_score"])
+                
+                # Enviar métrica de riesgo usando el registro enriquecido devuelto
+                risk_score = data.get("risk_score")
+                if risk_score is not None:
+                    try:
+                        event_id = data.get("event_id") or data.get("id") or "unknown"
+                        risk_level = data.get("risk_level", "UNKNOWN")
+                        statsd.gauge(
+                            "incendio.riesgo.puntaje",
+                            float(risk_score),
+                            tags=[f"nivel:{risk_level}", f"event_id:{event_id}"]
+                        )
+                        logger.info(
+                            "📊 Métrica enviada: incendio.riesgo.puntaje=%s nivel=%s event_id=%s",
+                            risk_score,
+                            risk_level,
+                            event_id
+                        )
+                    except Exception as exc:
+                        logger.error(f"❌ Error enviando métrica: {exc}", exc_info=True)
+                else:
+                    logger.warning("⚠️  risk_score no disponible en datos")
+                
                 mark_processed(key)
             except Exception as exc:
-                logging.warning("Fallo al enriquecer %s, se reintentará más tarde: %s", key, exc)
+                logger.warning("⚠️  Fallo al enriquecer %s, se reintentará más tarde: %s", key, exc)
                 statsd.increment("oro.registros.fallidos")
 
         if not has_items:

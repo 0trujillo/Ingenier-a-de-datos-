@@ -8,6 +8,7 @@ import time
 import os
 import logging
 import random
+import uuid
 
 from datadog import initialize, statsd
 from kafka import KafkaProducer
@@ -52,7 +53,10 @@ while True:
         air_quality_index = max(0, 50 + random.gauss(0, 30))  # AQI
         co2_level = 400 + random.gauss(0, 50)  # ppm
         
+        event_id = uuid.uuid4().hex
+
         data = {
+            "event_id": event_id,
             "sensor_id": sensor_id,
             "sensor_type": "environmental",
             "temperature": round(temperature, 2),
@@ -62,7 +66,8 @@ while True:
             "air_quality_index": round(air_quality_index, 2),
             "co2_level": round(co2_level, 2),
             "timestamp": time.time(),
-            "source": "sensor-simulator"
+            "source": "sensor-simulator",
+            "source_topic": KAFKA_TOPIC
         }
 
         producer.send(KAFKA_TOPIC, data)
@@ -70,8 +75,8 @@ while True:
         statsd.gauge("sensor.temperatura", data["temperature"])
         statsd.gauge("sensor.humedad", data["humidity"])
         statsd.gauge("sensor.indice_calidad_aire", data["air_quality_index"])
-        logging.info("Sensor #%d enviado: temp=%.1f°C, humedad=%.1f%%, AQI=%.1f",
-                     sensor_id, data["temperature"], data["humidity"], data["air_quality_index"])
+        logging.info("Sensor #%d enviado: event_id=%s temp=%.1f°C, humedad=%.1f%%, AQI=%.1f",
+                     sensor_id, event_id, data["temperature"], data["humidity"], data["air_quality_index"])
 
     except Exception as exc:
         logging.error("Error obteniendo datos de sensores: %s", exc, exc_info=True)

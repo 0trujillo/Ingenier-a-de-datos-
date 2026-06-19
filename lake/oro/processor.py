@@ -62,16 +62,24 @@ def enrich(record):
     final_record = {
         **record,
         "risk_score": prediction.get("risk_score"),
-        "risk_level": prediction.get("risk_level")
+        "risk_level": prediction.get("risk_level"),
+        "enriched_at": time.time()
     }
 
     try:
+        ts = int(time.time() * 1000)
+        event_id = final_record.get("event_id") or final_record.get("id")
+        if event_id:
+            key = f"gold_{event_id}_{ts}.json"
+        else:
+            key = f"gold_{ts}.json"
+
         s3.put_object(
             Bucket=ORO_BUCKET,
-            Key=f"gold_{int(time.time() * 1000)}.json",
+            Key=key,
             Body=json.dumps(final_record)
         )
-        logging.info("✅ Registro Oro guardado en %s", ORO_BUCKET)
+        logging.info("✅ Registro Oro guardado en %s (key=%s, event_id=%s)", ORO_BUCKET, key, event_id)
     except Exception as exc:
         logging.error("❌ Error guardando Oro: %s", exc, exc_info=True)
         raise

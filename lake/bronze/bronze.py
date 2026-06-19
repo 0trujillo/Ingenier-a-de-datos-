@@ -30,14 +30,19 @@ ensure_bucket(BRONZE_BUCKET)
 
 
 def upload(data):
-    key = f"bronze_{int(time.time() * 1000)}.json"
+    ts = int(time.time() * 1000)
+    event_id = data.get("event_id")
+    if event_id:
+        key = f"bronze_{event_id}_{ts}.json"
+    else:
+        key = f"bronze_{ts}.json"
     try:
         s3.put_object(
             Bucket=BRONZE_BUCKET,
             Key=key,
             Body=json.dumps(data)
         )
-        logging.info("✅ Bronze upload successful: %s", key)
+        logging.info("✅ Bronze upload successful: %s (event_id=%s)", key, event_id)
     except Exception as exc:
         logging.error("❌ Error al subir objeto a Bronze: %s", exc, exc_info=True)
         raise

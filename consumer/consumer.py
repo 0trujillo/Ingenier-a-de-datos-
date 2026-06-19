@@ -4,6 +4,7 @@ import logging
 import time
 import sys
 import os
+import uuid
 
 from datadog import initialize, statsd
 
@@ -61,10 +62,18 @@ for msg in consumer:
 
     data = msg.value
 
+    # Asegurar trazabilidad mínima
+    if not data.get("event_id"):
+        data["event_id"] = uuid.uuid4().hex
+
+    # Añadir metadata de ingestión
+    data["kafka_topic"] = msg.topic
+    data["received_at"] = time.time()
+
     try:
         upload(data)
         statsd.increment("bronze.registros.recibidos")
-        logging.info("✅ Registro enviado a Bronze")
+        logging.info("✅ Registro enviado a Bronze: event_id=%s", data.get("event_id"))
     except Exception as exc:
         statsd.increment("bronze.registros.fallidos")
-        logging.error("❌ Error subiendo a Bronze: %s", exc, exc_info=True)
+        logging.error("❌ Error subiendo a Bronze event_id=%s: %s", data.get("event_id"), exc, exc_info=True)

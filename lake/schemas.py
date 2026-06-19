@@ -83,7 +83,7 @@ class EnrichedWeatherData(BaseModel):
     timestamp: float
     processed_at: float
     risk_score: float = Field(..., ge=0, le=100, description="Score de riesgo predicho")
-    risk_level: str = Field(..., pattern="^(NORMAL|ALTO)$")
+    risk_level: str = Field(..., pattern="^(NORMAL|MEDIO|ALTO)$")
     enriched_at: float = Field(default_factory=lambda: datetime.now().timestamp())
 
 

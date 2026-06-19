@@ -43,6 +43,8 @@ The content is organized as follows:
 consumer/consumer.py
 consumer/Dockerfile
 consumer/event_aggregator.py
+debug_metrics.py
+diagnose_datadog.py
 docker-compose.yml
 lake/analytics/__init__.py
 lake/analytics/loader.py
@@ -83,6 +85,7 @@ import logging
 import time
 import sys
 import os
+import uuid
 
 from datadog import initialize, statsd
 
@@ -140,13 +143,21 @@ for msg in consumer:
 
     data = msg.value
 
+    # Asegurar trazabilidad mínima
+    if not data.get("event_id"):
+        data["event_id"] = uuid.uuid4().hex
+
+    # Añadir metadata de ingestión
+    data["kafka_topic"] = msg.topic
+    data["received_at"] = time.time()
+
     try:
         upload(data)
         statsd.increment("bronze.registros.recibidos")
-        logging.info("✅ Registro enviado a Bronze")
+        logging.info("✅ Registro enviado a Bronze: event_id=%s", data.get("event_id"))
     except Exception as exc:
         statsd.increment("bronze.registros.fallidos")
-        logging.error("❌ Error subiendo a Bronze: %s", exc, exc_info=True)
+        logging.error("❌ Error subiendo a Bronze event_id=%s: %s", data.get("event_id"), exc, exc_info=True)
 </file>
 
 <file path="consumer/Dockerfile">
@@ -175,6 +186,7 @@ from kafka import KafkaConsumer, KafkaProducer
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from datadog import initialize, statsd
+import uuid
 
 
 class EventAggregator:
@@ -237,8 +249,10 @@ class EventAggregator:
         self.logger.info("✅ Consumidor conectado a tópico: %s", topic)
         
         try:
-            for message in consumer:
+                for message in consumer:
                     event = message.value
+                    if not event.get("event_id"):
+                        event["event_id"] = uuid.uuid4().hex
                     enriched_event = self._enrich_event(event, topic)
                     self._publish_event(enriched_event)
                     
@@ -278,6 +292,11 @@ class EventAggregator:
             "source_topic": source_topic,
             "event_type": self._classify_event(source_topic)
         }
+        # Mantener trazabilidad en logs
+        try:
+            self.logger.debug("Enriquecido event_id=%s tipo=%s", enriched.get("event_id"), enriched.get("event_type"))
+        except Exception:
+            pass
         
         return enriched
     
@@ -329,6 +348,245 @@ if __name__ == "__main__":
     run_aggregator()
 </file>
 
+<file path="debug_metrics.py">
+#!/usr/bin/env python3
+"""
+Script de diagnóstico para verificar la métrica incendio.riesgo.puntaje
+"""
+
+import os
+import json
+import boto3
+import sys
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# Configuración
+MINIO_ENDPOINT_URL = os.getenv("MINIO_ENDPOINT_URL", "http://minio:9000")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "admin")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "admin123")
+PLATA_BUCKET = os.getenv("PLATA_BUCKET", "plata")
+ORO_BUCKET = os.getenv("ORO_BUCKET", "oro")
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=MINIO_ENDPOINT_URL,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+)
+
+def check_bucket_contents(bucket_name, limit=5):
+    """Verifica contenido de un bucket."""
+    logger.info(f"📦 Revisando bucket: {bucket_name}")
+    
+    try:
+        response = s3.list_objects_v2(Bucket=bucket_name, MaxKeys=limit)
+        
+        if "Contents" not in response:
+            logger.warning(f"   ❌ Bucket {bucket_name} está vacío")
+            return 0
+        
+        count = 0
+        for obj in response["Contents"]:
+            key = obj["Key"]
+            count += 1
+            logger.info(f"   ✅ {key} ({obj['Size']} bytes)")
+            
+            # Mostrar contenido si es JSON
+            if key.endswith(".json"):
+                try:
+                    file_obj = s3.get_object(Bucket=bucket_name, Key=key)
+                    data = json.loads(file_obj["Body"].read())
+                    
+                    if "risk_score" in data:
+                        logger.info(f"      📊 risk_score: {data['risk_score']}")
+                    if "risk_level" in data:
+                        logger.info(f"      🚨 risk_level: {data['risk_level']}")
+                except Exception as e:
+                    logger.error(f"      ❌ Error leyendo {key}: {e}")
+        
+        return count
+    
+    except Exception as exc:
+        logger.error(f"❌ Error listando {bucket_name}: {exc}", exc_info=True)
+        return -1
+
+def main():
+    logger.info("🔍 Iniciando diagnóstico de métricas...")
+    logger.info(f"   MinIO: {MINIO_ENDPOINT_URL}")
+    logger.info(f"   PLATA_BUCKET: {PLATA_BUCKET}")
+    logger.info(f"   ORO_BUCKET: {ORO_BUCKET}")
+    
+    plata_count = check_bucket_contents(PLATA_BUCKET)
+    oro_count = check_bucket_contents(ORO_BUCKET)
+    
+    logger.info(f"\n📊 Resumen:")
+    logger.info(f"   - Objetos en {PLATA_BUCKET}: {plata_count}")
+    logger.info(f"   - Objetos en {ORO_BUCKET}: {oro_count}")
+    
+    if plata_count == 0:
+        logger.warning("\n⚠️  No hay datos en PLATA_BUCKET")
+        logger.warning("   → Verifica que el consumer esté corriendo")
+        logger.warning("   → Verifica que el productor esté enviando eventos")
+    
+    if oro_count == 0:
+        logger.warning("\n⚠️  No hay datos en ORO_BUCKET")
+        logger.warning("   → Verifica que el gold runner esté corriendo")
+        logger.warning("   → Verifica que el modelo ML esté disponible")
+    
+    if oro_count > 0:
+        logger.info("\n✅ Hay datos enriquecidos. La métrica debería estar llegando a Datadog")
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="diagnose_datadog.py">
+#!/usr/bin/env python3
+"""
+Diagnóstico completo de Datadog y pipeline
+"""
+
+import os
+import json
+import boto3
+import socket
+import logging
+from datetime import datetime
+from datadog import initialize, statsd
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# Config
+DD_API_KEY = os.getenv("DD_API_KEY", "")
+DATADOG_HOST = os.getenv("DATADOG_HOST", "datadog")
+DATADOG_PORT = int(os.getenv("DATADOG_PORT", "8125"))
+MINIO_ENDPOINT_URL = os.getenv("MINIO_ENDPOINT_URL", "http://minio:9000")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "admin")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "admin123")
+ORO_BUCKET = os.getenv("ORO_BUCKET", "oro")
+
+def check_datadog_connectivity():
+    """Verifica conexión a Datadog agent (DogStatsD)"""
+    logger.info("\n=== 🔗 DATADOG CONNECTIVITY ===")
+    logger.info(f"Datadog Host: {DATADOG_HOST}")
+    logger.info(f"Datadog Port: {DATADOG_PORT}")
+    logger.info(f"API Key configured: {'✅' if DD_API_KEY else '❌'}")
+    
+    # Intentar conectar al socket UDP
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(2)
+        sock.sendto(b"test", (DATADOG_HOST, DATADOG_PORT))
+        sock.close()
+        logger.info(f"✅ Conexión UDP a {DATADOG_HOST}:{DATADOG_PORT} OK")
+        return True
+    except Exception as exc:
+        logger.error(f"❌ No se puede conectar a {DATADOG_HOST}:{DATADOG_PORT}: {exc}")
+        return False
+
+def test_metric_send():
+    """Intenta enviar una métrica de prueba"""
+    logger.info("\n=== 📤 TEST METRIC SEND ===")
+    
+    try:
+        initialize(statsd_host=DATADOG_HOST, statsd_port=DATADOG_PORT)
+        
+        # Enviar métrica de prueba
+        test_value = 42.5
+        statsd.gauge("test.diagnostic.metric", test_value)
+        logger.info(f"✅ Métrica de prueba enviada: test.diagnostic.metric = {test_value}")
+        
+        # Enviar métrica simulada de riesgo
+        risk_score = 75.3
+        statsd.gauge("incendio.riesgo.puntaje", risk_score)
+        logger.info(f"✅ Métrica simulada enviada: incendio.riesgo.puntaje = {risk_score}")
+        
+        return True
+    except Exception as exc:
+        logger.error(f"❌ Error enviando métrica: {exc}", exc_info=True)
+        return False
+
+def check_minio_data():
+    """Verifica si hay datos en MinIO"""
+    logger.info("\n=== 📦 MINIO DATA CHECK ===")
+    
+    try:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=MINIO_ENDPOINT_URL,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+        )
+        
+        # Listar buckets
+        response = s3.list_buckets()
+        buckets = [b["Name"] for b in response.get("Buckets", [])]
+        logger.info(f"✅ Buckets disponibles: {buckets}")
+        
+        # Verificar ORO_BUCKET
+        try:
+            response = s3.list_objects_v2(Bucket=ORO_BUCKET, MaxKeys=5)
+            
+            if "Contents" in response:
+                objects = response["Contents"]
+                logger.info(f"✅ Encontrados {len(objects)} objetos en {ORO_BUCKET}:")
+                for obj in objects:
+                    logger.info(f"   - {obj['Key']}")
+                    
+                    # Leer el primero para ver risk_score
+                    if obj["Key"].endswith(".json"):
+                        file_obj = s3.get_object(Bucket=ORO_BUCKET, Key=obj["Key"])
+                        data = json.loads(file_obj["Body"].read())
+                        if "risk_score" in data:
+                            logger.info(f"     📊 risk_score: {data['risk_score']}")
+                        break
+            else:
+                logger.warning(f"⚠️  {ORO_BUCKET} está vacío - no hay datos enriquecidos")
+                
+        except Exception as exc:
+            logger.error(f"❌ Error accediendo a {ORO_BUCKET}: {exc}")
+    
+    except Exception as exc:
+        logger.error(f"❌ Error conectando a MinIO: {exc}", exc_info=True)
+
+def print_summary():
+    """Imprime resumen de configuración"""
+    logger.info("\n=== ⚙️  CONFIGURATION ===")
+    logger.info(f"DD_API_KEY: {DD_API_KEY[:20]}..." if DD_API_KEY else "DD_API_KEY: NOT SET")
+    logger.info(f"DATADOG_HOST: {DATADOG_HOST}")
+    logger.info(f"DATADOG_PORT: {DATADOG_PORT}")
+    logger.info(f"MINIO_ENDPOINT_URL: {MINIO_ENDPOINT_URL}")
+    logger.info(f"ORO_BUCKET: {ORO_BUCKET}")
+
+def main():
+    logger.info("=" * 60)
+    logger.info("🔍 DIAGNÓSTICO DATADOG Y PIPELINE")
+    logger.info(f"Timestamp: {datetime.now()}")
+    logger.info("=" * 60)
+    
+    print_summary()
+    
+    connected = check_datadog_connectivity()
+    check_minio_data()
+    
+    if connected:
+        test_metric_send()
+        logger.info("\n💡 Tip: Ve a Datadog > Metrics > Metrics Explorer")
+        logger.info("   y busca 'incendio.riesgo.puntaje' o 'test.diagnostic.metric'")
+    else:
+        logger.error("\n⚠️  No hay conexión con Datadog agent")
+        logger.error("   Verifica que el contenedor 'datadog' esté corriendo:")
+        logger.error("   docker ps | grep datadog")
+        logger.error("   docker logs datadog")
+
+if __name__ == "__main__":
+    main()
+</file>
+
 <file path="docker-compose.yml">
 version: "3.8"
 
@@ -369,6 +627,8 @@ services:
 
   datadog:
     image: datadog/agent:latest
+    env_file:
+      - .env
     environment:
       DD_API_KEY: ${DD_API_KEY:-}
       DD_SITE: ${DD_SITE:-us5.datadoghq.com}
@@ -376,6 +636,7 @@ services:
       DD_APM_ENABLED: "true"
       DD_DOGSTATSD_NON_LOCAL_TRAFFIC: "true"
       DD_BIND_HOST: "0.0.0.0"
+      DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL: "true"
     ports:
       - "8125:8125/udp"
     volumes:
@@ -533,6 +794,7 @@ import sys
 import boto3
 import duckdb
 from pathlib import Path
+from datetime import datetime
 
 
 MINIO_ENDPOINT_URL = os.getenv("MINIO_ENDPOINT_URL", "http://minio:9000")
@@ -650,27 +912,40 @@ def init_duckdb():
 
 def load_to_duckdb(data):
     """Carga un registro a DuckDB."""
+    def to_timestamp(value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                value = float(value)
+            except ValueError:
+                return value
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value)
+        return value
+
     try:
-        db = duckdb.connect(DUCKDB_PATH)
-        
-        db.execute("""
-            INSERT INTO enriched_events 
-            (id, temperature, humidity, wind_speed, heat_index, 
-             risk_score, risk_level, processed_at, enriched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            data.get("id", f"event_{int(data.get('processed_at', 0))}"),
-            data.get("temperature"),
-            data.get("humidity"),
-            data.get("wind_speed"),
-            data.get("heat_index"),
-            data.get("risk_score"),
-            data.get("risk_level"),
-            data.get("processed_at"),
-            data.get("enriched_at")
-        ])
-        
-        db.close()
+        with duckdb.connect(DUCKDB_PATH) as db:
+            db.execute("""
+                INSERT INTO enriched_events 
+                (id, temperature, humidity, wind_speed, heat_index, 
+                 risk_score, risk_level, processed_at, enriched_at)
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM enriched_events WHERE id = ?
+                )
+            """, [
+                data.get("event_id") or data.get("id") or f"event_{int(data.get('processed_at', 0))}",
+                data.get("temperature"),
+                data.get("humidity"),
+                data.get("wind_speed"),
+                data.get("heat_index"),
+                data.get("risk_score"),
+                data.get("risk_level"),
+                to_timestamp(data.get("processed_at")),
+                to_timestamp(data.get("enriched_at")),
+                data.get("event_id") or data.get("id") or f"event_{int(data.get('processed_at', 0))}"
+            ])
         return True
     except Exception as exc:
         logger.error("Error cargando a DuckDB: %s", exc, exc_info=True)
@@ -824,14 +1099,19 @@ ensure_bucket(BRONZE_BUCKET)
 
 
 def upload(data):
-    key = f"bronze_{int(time.time() * 1000)}.json"
+    ts = int(time.time() * 1000)
+    event_id = data.get("event_id")
+    if event_id:
+        key = f"bronze_{event_id}_{ts}.json"
+    else:
+        key = f"bronze_{ts}.json"
     try:
         s3.put_object(
             Bucket=BRONZE_BUCKET,
             Key=key,
             Body=json.dumps(data)
         )
-        logging.info("✅ Bronze upload successful: %s", key)
+        logging.info("✅ Bronze upload successful: %s (event_id=%s)", key, event_id)
     except Exception as exc:
         logging.error("❌ Error al subir objeto a Bronze: %s", exc, exc_info=True)
         raise
@@ -933,16 +1213,24 @@ def enrich(record):
     final_record = {
         **record,
         "risk_score": prediction.get("risk_score"),
-        "risk_level": prediction.get("risk_level")
+        "risk_level": prediction.get("risk_level"),
+        "enriched_at": time.time()
     }
 
     try:
+        ts = int(time.time() * 1000)
+        event_id = final_record.get("event_id") or final_record.get("id")
+        if event_id:
+            key = f"gold_{event_id}_{ts}.json"
+        else:
+            key = f"gold_{ts}.json"
+
         s3.put_object(
             Bucket=ORO_BUCKET,
-            Key=f"gold_{int(time.time() * 1000)}.json",
+            Key=key,
             Body=json.dumps(final_record)
         )
-        logging.info("✅ Registro Oro guardado en %s", ORO_BUCKET)
+        logging.info("✅ Registro Oro guardado en %s (key=%s, event_id=%s)", ORO_BUCKET, key, event_id)
     except Exception as exc:
         logging.error("❌ Error guardando Oro: %s", exc, exc_info=True)
         raise
@@ -973,8 +1261,10 @@ PROCESSED_BUCKET = os.getenv("PROCESSED_BUCKET", "oro-processed")
 DATADOG_HOST = os.getenv("DATADOG_HOST", "datadog")
 DATADOG_PORT = int(os.getenv("DATADOG_PORT", "8125"))
 
+logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+logger.info(f"Inicializando DogStatsD: {DATADOG_HOST}:{DATADOG_PORT}")
 initialize(
     statsd_host=DATADOG_HOST,
     statsd_port=DATADOG_PORT
@@ -1061,14 +1351,35 @@ while True:
                 continue
 
             try:
-                enrich(data)
-                logging.info("Enriquecido -> %s", key)
+                data = enrich(data)
+                logger.info("✅ Enriquecido -> %s", key)
                 statsd.increment("oro.registros.enriquecidos")
-                if data.get("risk_score"):
-                    statsd.gauge("incendio.riesgo.puntaje", data["risk_score"])
+                
+                # Enviar métrica de riesgo usando el registro enriquecido devuelto
+                risk_score = data.get("risk_score")
+                if risk_score is not None:
+                    try:
+                        event_id = data.get("event_id") or data.get("id") or "unknown"
+                        risk_level = data.get("risk_level", "UNKNOWN")
+                        statsd.gauge(
+                            "incendio.riesgo.puntaje",
+                            float(risk_score),
+                            tags=[f"nivel:{risk_level}", f"event_id:{event_id}"]
+                        )
+                        logger.info(
+                            "📊 Métrica enviada: incendio.riesgo.puntaje=%s nivel=%s event_id=%s",
+                            risk_score,
+                            risk_level,
+                            event_id
+                        )
+                    except Exception as exc:
+                        logger.error(f"❌ Error enviando métrica: {exc}", exc_info=True)
+                else:
+                    logger.warning("⚠️  risk_score no disponible en datos")
+                
                 mark_processed(key)
             except Exception as exc:
-                logging.warning("Fallo al enriquecer %s, se reintentará más tarde: %s", key, exc)
+                logger.warning("⚠️  Fallo al enriquecer %s, se reintentará más tarde: %s", key, exc)
                 statsd.increment("oro.registros.fallidos")
 
         if not has_items:
@@ -1145,7 +1456,13 @@ def process_record(data):
         return None
 
     heat_index = temp + (wind * 0.2)
+    # Mantener trazabilidad
+    event_id = data.get("event_id") or data.get("id")
+    source_topic = data.get("source_topic") or data.get("kafka_topic") or data.get("source")
+
     return {
+        "event_id": event_id,
+        "source_topic": source_topic,
         "temperature": temp,
         "humidity": humidity,
         "wind_speed": wind,
@@ -2447,6 +2764,7 @@ import time
 import os
 import logging
 import requests
+import uuid
 
 from datadog import initialize, statsd
 from kafka import KafkaProducer
@@ -2510,11 +2828,16 @@ while True:
 
         current = payload.get("current", {})
 
+        event_id = uuid.uuid4().hex
+
         data = {
+            "event_id": event_id,
             "temperature": current.get("temperature_2m"),
             "humidity": current.get("relative_humidity_2m"),
             "wind_speed": current.get("wind_speed_10m"),
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "source_topic": KAFKA_TOPIC,
+            "source": "open-meteo"
         }
 
         if data["temperature"] is None or data["wind_speed"] is None or data["humidity"] is None:
@@ -2525,7 +2848,7 @@ while True:
         statsd.gauge("clima.temperatura", data["temperature"])
         statsd.gauge("clima.humedad", data["humidity"])
         statsd.gauge("clima.velocidad_viento", data["wind_speed"])
-        logging.info("Enviado: %s", data)
+        logging.info("Enviado: event_id=%s %s", event_id, data)
     except Exception as exc:
         logging.error("Error obteniendo datos meteorológicos: %s", exc, exc_info=True)
 
@@ -2543,6 +2866,7 @@ import time
 import os
 import logging
 import random
+import uuid
 
 from datadog import initialize, statsd
 from kafka import KafkaProducer
@@ -2587,7 +2911,10 @@ while True:
         air_quality_index = max(0, 50 + random.gauss(0, 30))  # AQI
         co2_level = 400 + random.gauss(0, 50)  # ppm
         
+        event_id = uuid.uuid4().hex
+
         data = {
+            "event_id": event_id,
             "sensor_id": sensor_id,
             "sensor_type": "environmental",
             "temperature": round(temperature, 2),
@@ -2597,7 +2924,8 @@ while True:
             "air_quality_index": round(air_quality_index, 2),
             "co2_level": round(co2_level, 2),
             "timestamp": time.time(),
-            "source": "sensor-simulator"
+            "source": "sensor-simulator",
+            "source_topic": KAFKA_TOPIC
         }
 
         producer.send(KAFKA_TOPIC, data)
@@ -2605,8 +2933,8 @@ while True:
         statsd.gauge("sensor.temperatura", data["temperature"])
         statsd.gauge("sensor.humedad", data["humidity"])
         statsd.gauge("sensor.indice_calidad_aire", data["air_quality_index"])
-        logging.info("Sensor #%d enviado: temp=%.1f°C, humedad=%.1f%%, AQI=%.1f",
-                     sensor_id, data["temperature"], data["humidity"], data["air_quality_index"])
+        logging.info("Sensor #%d enviado: event_id=%s temp=%.1f°C, humedad=%.1f%%, AQI=%.1f",
+                     sensor_id, event_id, data["temperature"], data["humidity"], data["air_quality_index"])
 
     except Exception as exc:
         logging.error("Error obteniendo datos de sensores: %s", exc, exc_info=True)
@@ -2682,8 +3010,10 @@ while True:
             object_types = random.sample(possible_types, min(num_objects, len(possible_types)))
         
         frame_id = str(uuid.uuid4())[:8]
+        event_id = uuid.uuid4().hex
         
         data = {
+            "event_id": event_id,
             "camera_id": camera_id,
             "camera_location": camera_info["location"],
             "zone": camera_info["zone"],
@@ -2698,7 +3028,8 @@ while True:
             "detection_confidence": round(detection_confidence, 3),
             "frame_size": f"{1920}x{1080}",
             "encoding": "h264",
-            "source": "video-simulator"
+            "source": "video-simulator",
+            "source_topic": KAFKA_TOPIC
         }
 
         producer.send(KAFKA_TOPIC, data)
@@ -2709,8 +3040,8 @@ while True:
         statsd.increment("video.movimiento.detectado", int(has_motion))
         
         motion_str = "MOVIMIENTO" if has_motion else "Sin actividad"
-        logging.info("📹 CAM-%s [%s] %s - Objetos: %d, FPS: %.1f",
-                     camera_id, camera_info["location"], motion_str, num_objects, data["fps"])
+        logging.info("📹 CAM-%s event_id=%s [%s] %s - Objetos: %d, FPS: %.1f",
+                 camera_id, event_id, camera_info["location"], motion_str, num_objects, data["fps"])
 
     except Exception as exc:
         logging.error("Error obteniendo datos de video: %s", exc, exc_info=True)
@@ -3238,26 +3569,43 @@ import os
 import time
 from datadog import initialize, statsd
 
+DATADOG_HOST = os.getenv("DATADOG_HOST", "localhost")
+DATADOG_PORT = int(os.getenv("DATADOG_PORT", "8125"))
 api_key = os.getenv("DD_API_KEY")
 if not api_key:
     raise RuntimeError("DD_API_KEY no está definido en el entorno")
 
 initialize(
-    api_key=api_key
+    api_key=api_key,
+    statsd_host=DATADOG_HOST,
+    statsd_port=DATADOG_PORT,
 )
 
 print("Enviando métricas de prueba...")
 
 for i in range(10):
+    temperature = 20 + i * 2
+    humidity = 15 + i * 3
+    wind_speed = 5 + i * 1.5
+    risk_score = round(min(100, max(0, 30 + i * 7)), 2)
+    risk_level = "ALTO" if risk_score >= 75 else "NORMAL"
+    event_id = f"test-{i+1}"
 
-    statsd.gauge("incendio.temperatura", 40)
-    statsd.gauge("incendio.humedad", 10)
-    statsd.gauge("incendio.velocidad_viento", 30)
-    statsd.gauge("incendio.riesgo.puntaje", 100)
+    statsd.gauge("incendio.temperatura", temperature, tags=[f"event_id:{event_id}"])
+    statsd.gauge("incendio.humedad", humidity, tags=[f"event_id:{event_id}"])
+    statsd.gauge("incendio.velocidad_viento", wind_speed, tags=[f"event_id:{event_id}"])
+    statsd.gauge(
+        "incendio.riesgo.puntaje",
+        risk_score,
+        tags=[f"nivel:{risk_level}", f"event_id:{event_id}"]
+    )
 
-    statsd.increment("incendio.alertas")
+    statsd.increment("incendio.alertas", tags=[f"nivel:{risk_level}"])
 
-    print(f"Prueba #{i+1}")
+    print(
+        f"Prueba #{i+1}: score={risk_score}, nivel={risk_level}, "
+        f"temp={temperature:.1f}, hum={humidity:.1f}, wind={wind_speed:.1f}"
+    )
 
     time.sleep(2)
 

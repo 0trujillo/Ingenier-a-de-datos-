@@ -65,8 +65,10 @@ while True:
             object_types = random.sample(possible_types, min(num_objects, len(possible_types)))
         
         frame_id = str(uuid.uuid4())[:8]
+        event_id = uuid.uuid4().hex
         
         data = {
+            "event_id": event_id,
             "camera_id": camera_id,
             "camera_location": camera_info["location"],
             "zone": camera_info["zone"],
@@ -81,7 +83,8 @@ while True:
             "detection_confidence": round(detection_confidence, 3),
             "frame_size": f"{1920}x{1080}",
             "encoding": "h264",
-            "source": "video-simulator"
+            "source": "video-simulator",
+            "source_topic": KAFKA_TOPIC
         }
 
         producer.send(KAFKA_TOPIC, data)
@@ -92,8 +95,8 @@ while True:
         statsd.increment("video.movimiento.detectado", int(has_motion))
         
         motion_str = "MOVIMIENTO" if has_motion else "Sin actividad"
-        logging.info("📹 CAM-%s [%s] %s - Objetos: %d, FPS: %.1f",
-                     camera_id, camera_info["location"], motion_str, num_objects, data["fps"])
+        logging.info("📹 CAM-%s event_id=%s [%s] %s - Objetos: %d, FPS: %.1f",
+                 camera_id, event_id, camera_info["location"], motion_str, num_objects, data["fps"])
 
     except Exception as exc:
         logging.error("Error obteniendo datos de video: %s", exc, exc_info=True)

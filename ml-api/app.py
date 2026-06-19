@@ -34,7 +34,7 @@ class PredictionRequest(BaseModel):
 class PredictionResponse(BaseModel):
     """Esquema de respuesta de predicción."""
     risk_score: float = Field(..., ge=0, le=100)
-    risk_level: str = Field(..., pattern="^(NORMAL|ALTO)$")
+    risk_level: str = Field(..., pattern="^(NORMAL|MEDIO|ALTO)$")
     model_version: str
     confidence: float = Field(..., ge=0, le=1)
 
@@ -148,8 +148,14 @@ async def predict(request: PredictionRequest) -> PredictionResponse:
         risk_probability = probabilities[1]  # Probabilidad de clase "ALTO"
         risk_score = risk_probability * 100
         
-        # Determinar nivel de riesgo
-        risk_level = "ALTO" if prediction == 1 else "NORMAL"
+        # Determinar nivel de riesgo a partir del score (3 niveles)
+        # score: 0-100
+        if risk_score >= 75:
+            risk_level = "ALTO"
+        elif risk_score >= 50:
+            risk_level = "MEDIO"
+        else:
+            risk_level = "NORMAL"
         
         logger.info(
             "🔮 Predicción: temp=%.1f, humidity=%.1f, wind=%.1f -> "

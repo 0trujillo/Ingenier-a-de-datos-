@@ -11,6 +11,7 @@ from kafka import KafkaConsumer, KafkaProducer
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from datadog import initialize, statsd
+import uuid
 
 
 class EventAggregator:
@@ -73,8 +74,10 @@ class EventAggregator:
         self.logger.info("✅ Consumidor conectado a tópico: %s", topic)
         
         try:
-            for message in consumer:
+                for message in consumer:
                     event = message.value
+                    if not event.get("event_id"):
+                        event["event_id"] = uuid.uuid4().hex
                     enriched_event = self._enrich_event(event, topic)
                     self._publish_event(enriched_event)
                     
@@ -114,6 +117,11 @@ class EventAggregator:
             "source_topic": source_topic,
             "event_type": self._classify_event(source_topic)
         }
+        # Mantener trazabilidad en logs
+        try:
+            self.logger.debug("Enriquecido event_id=%s tipo=%s", enriched.get("event_id"), enriched.get("event_type"))
+        except Exception:
+            pass
         
         return enriched
     

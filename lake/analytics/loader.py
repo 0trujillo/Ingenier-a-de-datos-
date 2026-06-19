@@ -11,6 +11,7 @@ import sys
 import boto3
 import duckdb
 from pathlib import Path
+from datetime import datetime
 
 
 MINIO_ENDPOINT_URL = os.getenv("MINIO_ENDPOINT_URL", "http://minio:9000")
@@ -128,27 +129,40 @@ def init_duckdb():
 
 def load_to_duckdb(data):
     """Carga un registro a DuckDB."""
+    def to_timestamp(value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                value = float(value)
+            except ValueError:
+                return value
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value)
+        return value
+
     try:
-        db = duckdb.connect(DUCKDB_PATH)
-        
-        db.execute("""
-            INSERT INTO enriched_events 
-            (id, temperature, humidity, wind_speed, heat_index, 
-             risk_score, risk_level, processed_at, enriched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            data.get("id", f"event_{int(data.get('processed_at', 0))}"),
-            data.get("temperature"),
-            data.get("humidity"),
-            data.get("wind_speed"),
-            data.get("heat_index"),
-            data.get("risk_score"),
-            data.get("risk_level"),
-            data.get("processed_at"),
-            data.get("enriched_at")
-        ])
-        
-        db.close()
+        with duckdb.connect(DUCKDB_PATH) as db:
+            db.execute("""
+                INSERT INTO enriched_events 
+                (id, temperature, humidity, wind_speed, heat_index, 
+                 risk_score, risk_level, processed_at, enriched_at)
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM enriched_events WHERE id = ?
+                )
+            """, [
+                data.get("event_id") or data.get("id") or f"event_{int(data.get('processed_at', 0))}",
+                data.get("temperature"),
+                data.get("humidity"),
+                data.get("wind_speed"),
+                data.get("heat_index"),
+                data.get("risk_score"),
+                data.get("risk_level"),
+                to_timestamp(data.get("processed_at")),
+                to_timestamp(data.get("enriched_at")),
+                data.get("event_id") or data.get("id") or f"event_{int(data.get('processed_at', 0))}"
+            ])
         return True
     except Exception as exc:
         logger.error("Error cargando a DuckDB: %s", exc, exc_info=True)
